@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>   // For SIOCGIFADDR, etc.
 #include <sys/select.h>  // For select()
 #include <linux/rtnetlink.h> // For Netlink RTMGRP_LINK messages
+#include <getopt.h>      // For getopt_long()
 
 // Basic logging macros
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
@@ -71,8 +72,22 @@ typedef struct {
 
 vrf_instance_t vrf_instances[MAX_VRFS];
 int num_vrfs = 0;
-int client_listen_fd = -1; // Global for now: socket to listen for DHCP client broadcasts
+// int client_listen_fd = -1; // Will be replaced by per-interface sockets
 int netlink_fd = -1;       // Socket for receiving Netlink RTMGRP_LINK messages
+
+#define MAX_IF_VRF_MAPS 10 // Max number of interface-to-VRF mappings
+
+typedef struct {
+    char if_name[IFNAMSIZ];
+    char vrf_name[MAX_VRF_NAME_LEN];
+    char if_ip_str[16]; // Store the IP address string for this interface
+    struct in_addr if_ip;   // Binary IP address for giaddr and source IP
+    int listen_fd;      // Socket FD for listening on this interface
+    int vrf_idx;        // Index into vrf_instances array once resolved
+} if_vrf_map_t;
+
+if_vrf_map_t if_vrf_maps[MAX_IF_VRF_MAPS];
+int num_if_vrf_maps = 0;
 
 // Placeholder for discovered VRF names from the system
 char discovered_vrf_names[MAX_VRFS][MAX_VRF_NAME_LEN];
@@ -431,39 +446,25 @@ void listen_and_dispatch_packets() {
 
     // Main select loop
     fd_set read_fds;
-    int max_fd = 0; // Will be determined dynamically
+    int max_fd = 0;
 
-    // Setup Netlink socket for link state monitoring (Step 2.1)
-    netlink_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if (netlink_fd < 0) {
-        LOG_ERROR("Failed to create Netlink socket");
-        // Not necessarily fatal for existing relay logic, but dynamic add/delete won't work
-        // We can choose to exit or continue without this feature. For now, log and continue.
-    } else {
-        struct sockaddr_nl nl_addr;
-        memset(&nl_addr, 0, sizeof(nl_addr));
-        nl_addr.nl_family = AF_NETLINK;
-        nl_addr.nl_groups = RTMGRP_LINK; // Subscribe to link notifications
-
-        if (bind(netlink_fd, (struct sockaddr *)&nl_addr, sizeof(nl_addr)) < 0) {
-            LOG_ERROR("Failed to bind Netlink socket");
-            close(netlink_fd);
-            netlink_fd = -1; // Mark as unusable
-        } else {
-            LOG_INFO("Netlink socket created (FD: %d) and bound for RTMGRP_LINK.", netlink_fd);
-        }
-    }
-
+    // Setup Netlink socket (moved from here to main() to be set up before initial VRF discovery/setup)
 
     while(1) {
         FD_ZERO(&read_fds);
         max_fd = 0;
 
-        if (client_listen_fd != -1) {
-            FD_SET(client_listen_fd, &read_fds);
-            if (client_listen_fd > max_fd) max_fd = client_listen_fd;
+        // Add per-interface client listening sockets
+        for (int i = 0; i < num_if_vrf_maps; ++i) {
+            if (if_vrf_maps[i].listen_fd != -1) {
+                FD_SET(if_vrf_maps[i].listen_fd, &read_fds);
+                if (if_vrf_maps[i].listen_fd > max_fd) {
+                    max_fd = if_vrf_maps[i].listen_fd;
+                }
+            }
         }
 
+        // Add Kea communication sockets
         for (int i = 0; i < num_vrfs; ++i) {
             if (vrf_instances[i].kea_comm_fd != -1) {
                 FD_SET(vrf_instances[i].kea_comm_fd, &read_fds);
@@ -473,32 +474,25 @@ void listen_and_dispatch_packets() {
             }
         }
 
+        // Add Netlink socket
         if (netlink_fd != -1) {
             FD_SET(netlink_fd, &read_fds);
             if (netlink_fd > max_fd) max_fd = netlink_fd;
         }
 
-        if (max_fd == 0 && num_vrfs == 0 && client_listen_fd == -1 && netlink_fd == -1) {
-            LOG_INFO("No active file descriptors to monitor. Sleeping before retry or exit.");
-            sleep(5); // Avoid busy loop if everything is down
-            // Potentially re-initialize or exit if this state persists
-            discover_vrfs(); // Try to re-discover if nothing is running.
-            // This could lead to re-setup if VRFs appear.
-            // If still num_vrfs == 0, then it will sleep again.
-            // This basic re-discovery isn't full dynamic handling yet.
-            if(num_vrfs == 0 && discovered_vrf_count > 0) { // If discovery found VRFs but setup failed
-                 // Attempt to re-initialize VRF instances if discovery found some but setup failed previously
-                LOG_INFO("Attempting to re-initialize VRF instances based on fresh discovery.");
-                // This logic for re-initialization needs to be robust similar to initial setup in main()
-                // For now, this is a simple placeholder for recovery.
-                // The main loop in main() which calls setup functions would be more appropriate for re-init.
-            }
+        // If there are no FDs to monitor (e.g. no mappings, no VRFs, Netlink failed)
+        if (max_fd == 0) {
+            LOG_INFO("No active file descriptors to monitor. Sleeping.");
+            sleep(5);
+            // Potentially try to re-evaluate mappings or VRFs if dynamic changes are expected
+            // For now, if all mappings are gone and no VRFs setup, it will just sleep.
+            // If Netlink is up, it might detect new VRFs.
+            // If mappings are added via a dynamic config mechanism later, that would re-populate FDs.
             continue;
         }
 
-
         struct timeval timeout;
-        timeout.tv_sec = 10; // Timeout for select, e.g., for periodic checks (like Kea process status)
+        timeout.tv_sec = 10; // Timeout for select, e.g., for periodic checks
         timeout.tv_usec = 0;
 
         LOG_DEBUG("Calling select() with max_fd %d...", max_fd);
@@ -530,117 +524,174 @@ void listen_and_dispatch_packets() {
             continue;
         }
 
-        // If client_listen_fd is set, process incoming client DHCP packet
-        if (FD_ISSET(client_listen_fd, &read_fds)) {
-            char buffer[DHCP_PACKET_BUFFER_SIZE];
-            struct sockaddr_in client_src_addr;
-            socklen_t client_src_addr_len = sizeof(client_src_addr);
-            ssize_t len = recvfrom(client_listen_fd, buffer, sizeof(buffer), 0,
-                                   (struct sockaddr*)&client_src_addr, &client_src_addr_len);
+        // Check per-interface client listening sockets
+        for (int map_idx = 0; map_idx < num_if_vrf_maps; ++map_idx) {
+            if (if_vrf_maps[map_idx].listen_fd != -1 && FD_ISSET(if_vrf_maps[map_idx].listen_fd, &read_fds)) {
+                char buffer[DHCP_PACKET_BUFFER_SIZE];
+                struct sockaddr_in client_src_addr;
+                socklen_t client_src_addr_len = sizeof(client_src_addr);
+                ssize_t len = recvfrom(if_vrf_maps[map_idx].listen_fd, buffer, sizeof(buffer), 0,
+                                       (struct sockaddr*)&client_src_addr, &client_src_addr_len);
 
-            if (len < (ssize_t)sizeof(dhcp_packet_t) - (ssize_t)sizeof( ((dhcp_packet_t*)0)->options) ) { // Basic check for min DHCP packet size
-                 if (len < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    LOG_ERROR("recvfrom client_listen_fd failed");
-                 } else if (len >=0) {
-                    LOG_DEBUG("Received short packet (%zd bytes) on client_listen_fd, ignoring.", len);
-                 }
-                 // continue or handle error
-            } else {
-                LOG_INFO("Received %zd bytes from client %s:%d on client_listen_fd",
-                         len, inet_ntoa(client_src_addr.sin_addr), ntohs(client_src_addr.sin_port));
-
-                dhcp_packet_t *dhcp_req = (dhcp_packet_t *)buffer;
-
-                if (dhcp_req->op == 1) { // BOOTREQUEST
-                    // For Phase 1, relay to the first VRF instance.
-                    // TODO: Need a mechanism to map client (e.g. by interface or source IP subnet) to VRF.
-                    if (num_vrfs > 0 && vrf_instances[0].kea_comm_fd != -1) {
-                        vrf_instance_t *target_vrf = &vrf_instances[0];
-                        LOG_DEBUG("Relaying BOOTREQUEST from client to VRF %s (Kea IP: %s)",
-                                  target_vrf->name, target_vrf->veth_ns_ip);
-
-                        // Set giaddr
-                        // dhcp_req->giaddr = inet_addr(target_vrf->veth_host_ip); // This IP is where Kea should reply
-                        // It seems Kea prefers giaddr to be 0 if the relay is on the same segment as client
-                        // Or, it should be an IP on the client's network segment.
-                        // For now, let's try setting it to the veth_host_ip, as this is the IP Kea can route back to.
-                        if (dhcp_req->giaddr == 0) { // Only set if not already set by another relay
-                           if (inet_pton(AF_INET, target_vrf->veth_host_ip, &(dhcp_req->giaddr)) != 1) {
-                                LOG_ERROR("Failed to convert veth_host_ip %s to network address for giaddr", target_vrf->veth_host_ip);
-                                // continue or error
-                           }
-                        }
-                        // dhcp_req->hops++; // Increment hops if acting as a full relay
-
-                        struct sockaddr_in kea_dest_addr;
-                        memset(&kea_dest_addr, 0, sizeof(kea_dest_addr));
-                        kea_dest_addr.sin_family = AF_INET;
-                        kea_dest_addr.sin_port = htons(DHCP_SERVER_PORT);
-                        if (inet_pton(AF_INET, target_vrf->veth_ns_ip, &kea_dest_addr.sin_addr) <= 0) {
-                            LOG_ERROR("Invalid Kea ns IP address for VRF %s: %s", target_vrf->name, target_vrf->veth_ns_ip);
-                            // continue or error
-                        }
-
-                        if (sendto(target_vrf->kea_comm_fd, buffer, len, 0,
-                                   (struct sockaddr *)&kea_dest_addr, sizeof(kea_dest_addr)) < 0) {
-                            LOG_ERROR("sendto failed when relaying to Kea for VRF %s", target_vrf->name);
-                        } else {
-                            LOG_INFO("Relayed client packet to Kea for VRF %s", target_vrf->name);
-                        }
-                    } else {
-                        LOG_WARN("No VRFs available or Kea socket not ready to relay client request.");
+                if (len < (ssize_t)sizeof(dhcp_packet_t) - (ssize_t)sizeof(((dhcp_packet_t*)0)->options)) {
+                    if (len < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                        LOG_ERROR("recvfrom on client interface %s (FD %d) failed", if_vrf_maps[map_idx].if_name, if_vrf_maps[map_idx].listen_fd);
+                    } else if (len >=0) {
+                        LOG_DEBUG("Short packet (%zd bytes) on client interface %s, ignoring.", len, if_vrf_maps[map_idx].if_name);
                     }
                 } else {
-                    LOG_DEBUG("Received non-BOOTREQUEST packet (op=%d) on client_listen_fd, ignoring.", dhcp_req->op);
+                    LOG_INFO("Received %zd bytes from client %s:%d on interface %s (FD %d)",
+                             len, inet_ntoa(client_src_addr.sin_addr), ntohs(client_src_addr.sin_port),
+                             if_vrf_maps[map_idx].if_name, if_vrf_maps[map_idx].listen_fd);
+
+                    dhcp_packet_t *dhcp_req = (dhcp_packet_t *)buffer;
+                    if (dhcp_req->op == 1) { // BOOTREQUEST
+                        int target_vrf_idx = if_vrf_maps[map_idx].vrf_idx;
+
+                        if (target_vrf_idx != -1 && target_vrf_idx < num_vrfs) {
+                            vrf_instance_t *target_vrf = &vrf_instances[target_vrf_idx];
+                            if (target_vrf->kea_comm_fd != -1) { // Check if Kea's socket is ready
+                                LOG_DEBUG("Relaying BOOTREQUEST from client on %s (IP %s) to VRF %s (Kea IP: %s)",
+                                          if_vrf_maps[map_idx].if_name,
+                                          if_vrf_maps[map_idx].if_ip_str,
+                                          target_vrf->name,
+                                          target_vrf->veth_ns_ip);
+
+                                // Set giaddr to the IP of the interface that received the client's broadcast
+                                if (dhcp_req->giaddr == 0) { // Only set if not already set by another relay
+                                    dhcp_req->giaddr = if_vrf_maps[map_idx].if_ip.s_addr;
+                                }
+                                // dhcp_req->hops++; // Optional: if acting as a standards-compliant relay
+
+                                struct sockaddr_in kea_dest_addr;
+                            memset(&kea_dest_addr, 0, sizeof(kea_dest_addr));
+                            kea_dest_addr.sin_family = AF_INET;
+                            kea_dest_addr.sin_port = htons(DHCP_SERVER_PORT);
+                            if (inet_pton(AF_INET, target_vrf->veth_ns_ip, &kea_dest_addr.sin_addr) <= 0) {
+                                LOG_ERROR("Invalid Kea ns IP for VRF %s: %s", target_vrf->name, target_vrf->veth_ns_ip);
+                                continue; // Skip to next readable FD in select()
+                            }
+
+                            if (sendto(target_vrf->kea_comm_fd, buffer, len, 0,
+                                       (struct sockaddr *)&kea_dest_addr, sizeof(kea_dest_addr)) < 0) {
+                                LOG_ERROR("sendto failed relaying to Kea for VRF %s from interface %s", target_vrf->name, if_vrf_maps[map_idx].if_name);
+                            } else {
+                                LOG_INFO("Relayed client packet from %s to Kea for VRF %s", if_vrf_maps[map_idx].if_name, target_vrf->name);
+                            }
+                        } else {
+                            LOG_WARN("Target VRF %s for interface %s has no active Kea communication socket.",
+                                     (target_vrf_idx != -1 && target_vrf_idx < num_vrfs) ? vrf_instances[target_vrf_idx].name : "N/A",
+                                     if_vrf_maps[map_idx].if_name);
+                        }
+                    } else {
+                        LOG_WARN("No valid target VRF resolved for request from interface %s (mapped to VRF name '%s', resolved index %d). Packet dropped.",
+                                 if_vrf_maps[map_idx].if_name, if_vrf_maps[map_idx].vrf_name, target_vrf_idx);
+                    }
+                } else {
+                    LOG_DEBUG("Non-BOOTREQUEST (op=%d) on interface %s, ignoring.", dhcp_req->op, if_vrf_maps[map_idx].if_name);
+                    }
                 }
             }
         }
 
-        // Check Kea communication sockets
-        for (int i = 0; i < num_vrfs; ++i) {
+        // Check Kea communication sockets (for replies from Kea)
+        for (int i = 0; i < num_vrfs; ++i) { // Iterate through all potentially active VRF instances
             if (vrf_instances[i].kea_comm_fd != -1 && FD_ISSET(vrf_instances[i].kea_comm_fd, &read_fds)) {
                 char buffer[DHCP_PACKET_BUFFER_SIZE];
-                struct sockaddr_in kea_src_addr; // Kea's actual source IP (should be veth_ns_ip)
+                struct sockaddr_in kea_src_addr;
                 socklen_t kea_src_addr_len = sizeof(kea_src_addr);
                 ssize_t len = recvfrom(vrf_instances[i].kea_comm_fd, buffer, sizeof(buffer), 0,
                                        (struct sockaddr*)&kea_src_addr, &kea_src_addr_len);
 
-                if (len < (ssize_t)sizeof(dhcp_packet_t) - (ssize_t)sizeof( ((dhcp_packet_t*)0)->options) ) {
-                    if (len < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                if (len < (ssize_t)sizeof(dhcp_packet_t) - (ssize_t)sizeof(((dhcp_packet_t*)0)->options)) {
+                     if (len < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
                         LOG_ERROR("recvfrom kea_comm_fd for VRF %s failed", vrf_instances[i].name);
                     } else if (len >=0 ) {
-                        LOG_DEBUG("Received short packet (%zd bytes) from Kea for VRF %s, ignoring.", len, vrf_instances[i].name);
+                        LOG_DEBUG("Short packet (%zd bytes) from Kea for VRF %s, ignoring.", len, vrf_instances[i].name);
                     }
-                    // continue or handle error
                 } else {
                     LOG_INFO("Received %zd bytes from Kea for VRF %s (source %s:%d)",
                              len, vrf_instances[i].name, inet_ntoa(kea_src_addr.sin_addr), ntohs(kea_src_addr.sin_port));
 
                     dhcp_packet_t *dhcp_reply = (dhcp_packet_t *)buffer;
-
                     if (dhcp_reply->op == 2) { // BOOTREPLY
-                        if (client_listen_fd != -1) { // Ensure client socket is valid
+                        // Determine which client-facing interface this reply corresponds to.
+                        // This requires that the original request's if_vrf_map index was stored or can be found.
+                        // For now, we find the if_vrf_map entry that points to this vrf_instance.
+                        // This assumes a one-to-one mapping from a client iface to a VRF for relay for simplicity.
+                        // If a VRF can be reached by multiple client ifaces, this needs more thought.
+                        int reply_map_idx = -1;
+                        for(int k=0; k < num_if_vrf_maps; ++k) {
+                            if (if_vrf_maps[k].vrf_idx == i) { // 'i' is the index of vrf_instances
+                                reply_map_idx = k;
+                                break;
+                            }
+                        }
+
+                        if (reply_map_idx != -1 && if_vrf_maps[reply_map_idx].listen_fd != -1) {
+                            // Use sendmsg with IP_PKTINFO to set source IP for the reply.
+                            // For now, simple sendto broadcast via the specific interface's listening socket.
+                            // This might not set source IP correctly if socket is INADDR_ANY.
+                            // Step 4: Use sendmsg with IP_PKTINFO to set source IP for the reply.
                             struct sockaddr_in client_dest_addr;
                             memset(&client_dest_addr, 0, sizeof(client_dest_addr));
                             client_dest_addr.sin_family = AF_INET;
                             client_dest_addr.sin_port = htons(DHCP_CLIENT_PORT);
-                            client_dest_addr.sin_addr.s_addr = INADDR_BROADCAST;
 
-                            if (sendto(client_listen_fd, buffer, len, 0,
-                                       (struct sockaddr *)&client_dest_addr, sizeof(client_dest_addr)) < 0) {
-                                LOG_ERROR("sendto failed when relaying to client for VRF %s", vrf_instances[i].name);
+                            // Determine destination IP: yiaddr if available and unicast allowed, else broadcast
+                            if (dhcp_reply->yiaddr != 0 && !(ntohs(dhcp_reply->flags) & 0x8000)) { // 0x8000 is BROADCAST flag
+                                client_dest_addr.sin_addr.s_addr = dhcp_reply->yiaddr;
+                                LOG_DEBUG("Targeting reply to yiaddr: %s", inet_ntoa(client_dest_addr.sin_addr));
                             } else {
-                                LOG_INFO("Relayed Kea reply to client broadcast for VRF %s", vrf_instances[i].name);
+                                client_dest_addr.sin_addr.s_addr = INADDR_BROADCAST;
+                                LOG_DEBUG("Targeting reply to INADDR_BROADCAST");
+                            }
+
+                            struct msghdr msg;
+                            struct iovec iov[1];
+                            iov[0].iov_base = buffer;
+                            iov[0].iov_len = len;
+
+                            // Ancillary data for IP_PKTINFO
+                            char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+
+                            memset(&msg, 0, sizeof(msg));
+                            msg.msg_name = &client_dest_addr;
+                            msg.msg_namelen = sizeof(client_dest_addr);
+                            msg.msg_iov = iov;
+                            msg.msg_iovlen = 1;
+                            msg.msg_control = cmsg_buf;
+                            msg.msg_controllen = sizeof(cmsg_buf);
+
+                            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+                            cmsg->cmsg_level = IPPROTO_IP;
+                            cmsg->cmsg_type = IP_PKTINFO;
+                            cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+
+                            struct in_pktinfo *pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
+                            memset(pktinfo, 0, sizeof(struct in_pktinfo));
+                            pktinfo->ipi_spec_dst.s_addr = if_vrf_maps[reply_map_idx].if_ip.s_addr; // Source IP for reply
+                            // pktinfo->ipi_ifindex = 0; // Kernel will choose interface based on routing if 0, or set specific if_index if known
+
+                            if (sendmsg(if_vrf_maps[reply_map_idx].listen_fd, &msg, 0) < 0) {
+                                LOG_ERROR("sendmsg failed relaying to client via interface %s for VRF %s",
+                                          if_vrf_maps[reply_map_idx].if_name, vrf_instances[i].name);
+                            } else {
+                                LOG_INFO("Relayed Kea reply via sendmsg on interface %s (src IP %s) for VRF %s",
+                                         if_vrf_maps[reply_map_idx].if_name,
+                                         if_vrf_maps[reply_map_idx].if_ip_str,
+                                         vrf_instances[i].name);
                             }
                         } else {
-                            LOG_WARN("Client listen socket is not valid, cannot relay Kea reply for VRF %s.", vrf_instances[i].name);
+                             LOG_WARN("Could not find client interface mapping to relay Kea reply for VRF %s or listen_fd is invalid.", vrf_instances[i].name);
                         }
                     } else {
-                        LOG_DEBUG("Received non-BOOTREPLY packet (op=%d) from Kea for VRF %s, ignoring.", dhcp_reply->op, vrf_instances[i].name);
+                         LOG_DEBUG("Non-BOOTREPLY (op=%d) from Kea for VRF %s, ignoring.", dhcp_reply->op, vrf_instances[i].name);
                     }
                 }
             }
         }
+
 
         // Handle Netlink messages (Step 2.2)
         if (netlink_fd != -1 && FD_ISSET(netlink_fd, &read_fds)) {
@@ -834,11 +885,15 @@ void signal_handler(int sig) {
         }
     }
 
-    if (client_listen_fd != -1) {
-        LOG_INFO("Closing client listening socket FD %d.", client_listen_fd);
-        close(client_listen_fd);
-        client_listen_fd = -1;
+    // Close per-interface client listening sockets
+    for (int i = 0; i < num_if_vrf_maps; ++i) {
+        if (if_vrf_maps[i].listen_fd != -1) {
+            LOG_INFO("Closing client listening socket for interface %s (FD %d).", if_vrf_maps[i].if_name, if_vrf_maps[i].listen_fd);
+            close(if_vrf_maps[i].listen_fd);
+            if_vrf_maps[i].listen_fd = -1;
+        }
     }
+
     if (netlink_fd != -1) {
         LOG_INFO("Closing Netlink socket FD %d.", netlink_fd);
         close(netlink_fd);
@@ -847,15 +902,86 @@ void signal_handler(int sig) {
     exit(0);
 }
 
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "Usage: %s [-m <if_name>:<vrf_name>:<if_ip>] ...\n", prog_name);
+    fprintf(stderr, "  -m <if_name>:<vrf_name>:<if_ip> : Map client interface to a VRF and specify interface IP for giaddr.\n");
+    fprintf(stderr, "                                     Example: -m eth1:vrf-red:192.168.1.1\n");
+    fprintf(stderr, "  At least one -m mapping is required for relay functionality.\n");
+}
 
 int main(int argc, char *argv[]) {
     LOG_INFO("Kea Per-VRF DHCP Service Orchestrator starting...");
 
+    int opt;
+    while ((opt = getopt(argc, argv, "m:")) != -1) {
+        switch (opt) {
+            case 'm':
+                if (num_if_vrf_maps >= MAX_IF_VRF_MAPS) {
+                    LOG_ERROR("Maximum number of interface-VRF mappings (%d) reached. Ignoring further -m options.", MAX_IF_VRF_MAPS);
+                    continue;
+                }
+                char *if_details = optarg;
+                char *token;
+                char *saveptr;
+
+                // if_name
+                token = strtok_r(if_details, ":", &saveptr);
+                if (!token) {
+                    LOG_ERROR("Invalid -m format: %s. Expected <if_name>:<vrf_name>:<if_ip>", optarg);
+                    continue;
+                }
+                strncpy(if_vrf_maps[num_if_vrf_maps].if_name, token, IFNAMSIZ -1);
+                if_vrf_maps[num_if_vrf_maps].if_name[IFNAMSIZ-1] = '\0';
+
+                // vrf_name
+                token = strtok_r(NULL, ":", &saveptr);
+                if (!token) {
+                    LOG_ERROR("Invalid -m format: %s. Expected <if_name>:<vrf_name>:<if_ip>", optarg);
+                    continue;
+                }
+                strncpy(if_vrf_maps[num_if_vrf_maps].vrf_name, token, MAX_VRF_NAME_LEN -1);
+                if_vrf_maps[num_if_vrf_maps].vrf_name[MAX_VRF_NAME_LEN-1] = '\0';
+
+                // if_ip
+                token = strtok_r(NULL, ":", &saveptr);
+                if (!token) {
+                    LOG_ERROR("Invalid -m format: %s. Expected <if_name>:<vrf_name>:<if_ip>", optarg);
+                    continue;
+                }
+                strncpy(if_vrf_maps[num_if_vrf_maps].if_ip_str, token, sizeof(if_vrf_maps[num_if_vrf_maps].if_ip_str) -1);
+                if_vrf_maps[num_if_vrf_maps].if_ip_str[sizeof(if_vrf_maps[num_if_vrf_maps].if_ip_str)-1] = '\0';
+
+                if (inet_pton(AF_INET, if_vrf_maps[num_if_vrf_maps].if_ip_str, &if_vrf_maps[num_if_vrf_maps].if_ip) != 1) {
+                    LOG_ERROR("Invalid IP address '%s' in mapping for interface %s.",
+                              if_vrf_maps[num_if_vrf_maps].if_ip_str, if_vrf_maps[num_if_vrf_maps].if_name);
+                    // Reset this map entry by not incrementing num_if_vrf_maps or explicitly clearing.
+                    continue;
+                }
+
+                if_vrf_maps[num_if_vrf_maps].listen_fd = -1; // To be created later
+                if_vrf_maps[num_if_vrf_maps].vrf_idx = -1;   // To be resolved later
+
+                LOG_INFO("Added mapping: Interface '%s' -> VRF '%s' (Interface IP for giaddr: %s)",
+                         if_vrf_maps[num_if_vrf_maps].if_name,
+                         if_vrf_maps[num_if_vrf_maps].vrf_name,
+                         if_vrf_maps[num_if_vrf_maps].if_ip_str);
+                num_if_vrf_maps++;
+                break;
+            default: /* '?' */
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+        }
+    }
+
+    if (num_if_vrf_maps == 0) {
+        LOG_WARN("No client interface to VRF mappings provided via -m option. DHCP relay functionality will be limited.");
+        // Depending on desired behavior, could exit if relay is primary function.
+        // For now, it can still manage VRFs dynamically even if it can't relay.
+    }
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Ensure config directory exists (relative to build/orchestrator)
-    // This path might need to be more robust or configurable
     struct stat st = {0};
     if (stat(KEA_CONFIG_DIR, &st) == -1) {
         LOG_INFO("Creating Kea config directory: %s", KEA_CONFIG_DIR);
@@ -865,72 +991,136 @@ int main(int argc, char *argv[]) {
         }
     }
 
-
-    discover_vrfs(); // Simplified for now
-
-    if (discovered_vrf_count == 0) {
-        LOG_INFO("No VRFs discovered. Exiting.");
-        return EXIT_SUCCESS;
+    // Setup Netlink socket for dynamic VRF monitoring (before initial VRF setup)
+    netlink_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (netlink_fd < 0) {
+        LOG_ERROR("Failed to create Netlink socket for VRF monitoring. Dynamic add/delete will not work.");
+    } else {
+        struct sockaddr_nl nl_addr;
+        memset(&nl_addr, 0, sizeof(nl_addr));
+        nl_addr.nl_family = AF_NETLINK;
+        nl_addr.nl_groups = RTMGRP_LINK;
+        if (bind(netlink_fd, (struct sockaddr *)&nl_addr, sizeof(nl_addr)) < 0) {
+            LOG_ERROR("Failed to bind Netlink socket. Dynamic add/delete will not work.");
+            close(netlink_fd);
+            netlink_fd = -1;
+        } else {
+            LOG_INFO("Netlink socket for VRF monitoring created (FD: %d).", netlink_fd);
+        }
     }
-    if (discovered_vrf_count > MAX_VRFS) {
-        LOG_ERROR("Discovered %d VRFs, but MAX_VRFS is %d. Some will be ignored.", discovered_vrf_count, MAX_VRFS);
-        discovered_vrf_count = MAX_VRFS;
-    }
 
-    num_vrfs = 0; // Reset actual number of successfully processed VRFs
+    // Initial discovery and setup of pre-existing VRFs
+    discover_vrfs();
+    // Note: discovered_vrf_count is set by discover_vrfs()
+    // num_vrfs is the count of successfully *managed* VRFs.
+
+    // This loop will be modified or augmented by Netlink dynamic handling later
+    // For now, it sets up initially discovered VRFs.
+    num_vrfs = 0;
     for (int i = 0; i < discovered_vrf_count; ++i) {
         // Initialize the new instance before attempting cleanup or setup
         memset(&vrf_instances[num_vrfs], 0, sizeof(vrf_instance_t)); // Clears PIDs, IPs, names
         vrf_instances[num_vrfs].kea_comm_fd = -1; // Important initialization for sockets
 
-        strncpy(vrf_instances[num_vrfs].name, discovered_vrf_names[i], MAX_VRF_NAME_LEN - 1);
-        vrf_instances[num_vrfs].name[MAX_VRF_NAME_LEN - 1] = '\0'; // Ensure null termination
+    for (int i = 0; i < discovered_vrf_count; ++i) {
+        if (num_vrfs >= MAX_VRFS) {
+            LOG_WARN("MAX_VRFS limit reached during initial setup. Ignoring further discovered VRFs.");
+            break;
+        }
+        vrf_instance_t *current_vrf = &vrf_instances[num_vrfs]; // Use pointer for clarity
 
-        LOG_INFO("Processing discovered VRF: %s", vrf_instances[num_vrfs].name);
+        memset(current_vrf, 0, sizeof(vrf_instance_t));
+        current_vrf->kea_comm_fd = -1;
 
-        // Populate names needed for a targeted pre-cleanup, then call cleanup.
-        // This ensures cleanup_vrf_instance has the correct names to find old resources.
-        snprintf(vrf_instances[num_vrfs].ns_name, sizeof(vrf_instances[num_vrfs].ns_name), "%s_ns", vrf_instances[num_vrfs].name);
-        snprintf(vrf_instances[num_vrfs].veth_host, IFNAMSIZ, "v%.8s_h", vrf_instances[num_vrfs].name);
-        // Note: veth_ns, IPs, PIDs are not needed for the pre-cleanup of named network objects.
-        // kea_comm_fd is already -1.
+        strncpy(current_vrf->name, discovered_vrf_names[i], MAX_VRF_NAME_LEN - 1);
+        current_vrf->name[MAX_VRF_NAME_LEN - 1] = '\0';
 
-        // Attempt cleanup first for this specific VRF name in case of previous unclean shutdown
-        cleanup_vrf_instance(&vrf_instances[num_vrfs]); // Cleans based on ns_name and veth_host
+        LOG_INFO("Processing initially discovered VRF: %s", current_vrf->name);
 
+        snprintf(current_vrf->ns_name, sizeof(current_vrf->ns_name), "%s_ns", current_vrf->name);
+        snprintf(current_vrf->veth_host, IFNAMSIZ, "v%.8s_h", current_vrf->name);
 
-        if (setup_namespace_for_vrf(&vrf_instances[num_vrfs], num_vrfs) == 0) {
-            if (launch_kea_in_namespace(&vrf_instances[num_vrfs]) == 0) {
-                if (setup_kea_communication_socket(&vrf_instances[num_vrfs]) == 0) {
-                    num_vrfs++; // Increment *actual* count of successfully set up VRFs
+        cleanup_vrf_instance(current_vrf);
+
+        if (setup_namespace_for_vrf(current_vrf, num_vrfs) == 0) {
+            if (launch_kea_in_namespace(current_vrf) == 0) {
+                if (setup_kea_communication_socket(current_vrf) == 0) {
+                    LOG_INFO("Successfully set up initially discovered VRF: %s", current_vrf->name);
+                    num_vrfs++;
                 } else {
-                    LOG_ERROR("Failed to setup Kea communication socket for VRF %s. Cleaning up.", vrf_instances[num_vrfs].name);
-                    // launch_kea_in_namespace succeeded, so Kea might be running. cleanup_vrf_instance will stop it.
-                    cleanup_vrf_instance(&vrf_instances[num_vrfs]);
+                    LOG_ERROR("Failed to setup Kea communication socket for initial VRF %s.", current_vrf->name);
+                    cleanup_vrf_instance(current_vrf);
                 }
             } else {
-                LOG_ERROR("Failed to launch Kea for VRF %s. Cleaning up this VRF's resources.", vrf_instances[num_vrfs].name);
-                cleanup_vrf_instance(&vrf_instances[num_vrfs]);
-                // Do not increment num_vrfs for this one
+                LOG_ERROR("Failed to launch Kea for initial VRF %s.", current_vrf->name);
+                cleanup_vrf_instance(current_vrf);
             }
         } else {
-            LOG_ERROR("Failed to setup namespace for VRF %s. Resources might be partially created.", vrf_instances[num_vrfs].name);
-            // Attempt cleanup for this VRF as setup might have partially succeeded
-            cleanup_vrf_instance(&vrf_instances[num_vrfs]);
-            // Do not increment num_vrfs
+            LOG_ERROR("Failed to setup namespace for initial VRF %s.", current_vrf->name);
+            cleanup_vrf_instance(current_vrf);
         }
     }
 
-    if (num_vrfs == 0) {
-        LOG_ERROR("Failed to set up any VRF instances successfully. Exiting.");
-        return EXIT_FAILURE;
+    if (num_if_vrf_maps > 0 && num_vrfs == 0) {
+         LOG_WARN("Interface mappings provided, but no VRFs were successfully set up initially. Relay will not function until VRFs are active.");
+    }
+    // It's okay if num_vrfs is 0 initially if we expect them to be added dynamically.
+
+    // Resolve VRF indexes for mappings initially
+    for (int i = 0; i < num_if_vrf_maps; ++i) {
+        if_vrf_maps[i].vrf_idx = -1; // Ensure it's reset before trying to resolve
+        for (int j = 0; j < num_vrfs; ++j) {
+            if (strcmp(if_vrf_maps[i].vrf_name, vrf_instances[j].name) == 0) {
+                if_vrf_maps[i].vrf_idx = j;
+                LOG_INFO("Resolved mapping: Interface '%s' (IP %s) linked to active VRF '%s' (index %d).",
+                         if_vrf_maps[i].if_name, if_vrf_maps[i].if_ip_str, vrf_instances[j].name, j);
+                break;
+            }
+        }
+        if (if_vrf_maps[i].vrf_idx == -1) {
+            LOG_WARN("VRF '%s' for interface map '%s' not (yet) active or discovered during initial setup.",
+                     if_vrf_maps[i].vrf_name, if_vrf_maps[i].if_name);
+        }
     }
 
-    LOG_INFO("Successfully set up %d VRF instance(s).", num_vrfs);
+    // Setup listening sockets for each mapped client interface
+    for (int i = 0; i < num_if_vrf_maps; ++i) {
+        if_vrf_maps[i].listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (if_vrf_maps[i].listen_fd < 0) {
+            LOG_ERROR("Failed to create client listening socket for interface %s (%s)", if_vrf_maps[i].if_name, if_vrf_maps[i].if_ip_str);
+            // This mapping will be unusable. Consider how to handle this - skip or abort? For now, skip.
+            continue;
+        }
 
-    listen_and_dispatch_packets(); // Main loop
+        int broadcast_enable = 1;
+        if (setsockopt(if_vrf_maps[i].listen_fd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+            LOG_ERROR("Failed to set SO_BROADCAST on client listening socket for %s", if_vrf_maps[i].if_name);
+            close(if_vrf_maps[i].listen_fd);
+            if_vrf_maps[i].listen_fd = -1;
+            continue;
+        }
 
-    // Cleanup (normally reached only if listen_and_dispatch_packets exits, or via signal handler)
+        // Bind to specific interface IP
+        struct sockaddr_in client_bind_addr;
+        memset(&client_bind_addr, 0, sizeof(client_bind_addr));
+        client_bind_addr.sin_family = AF_INET;
+        client_bind_addr.sin_port = htons(DHCP_SERVER_PORT);
+        client_bind_addr.sin_addr.s_addr = if_vrf_maps[i].if_ip.s_addr; // Bind to the specific interface IP
+
+        if (bind(if_vrf_maps[i].listen_fd, (struct sockaddr *)&client_bind_addr, sizeof(client_bind_addr)) < 0) {
+            LOG_ERROR("Failed to bind client listening socket to %s:%d for interface %s", if_vrf_maps[i].if_ip_str, DHCP_SERVER_PORT, if_vrf_maps[i].if_name);
+            close(if_vrf_maps[i].listen_fd);
+            if_vrf_maps[i].listen_fd = -1;
+            continue;
+        }
+        LOG_INFO("Client listening socket for interface %s created (FD: %d), bound to %s:%d",
+                 if_vrf_maps[i].if_name, if_vrf_maps[i].listen_fd, if_vrf_maps[i].if_ip_str, DHCP_SERVER_PORT);
+    }
+
+
+    listen_and_dispatch_packets();
+
+    // Cleanup (normally reached only via signal handler, but good practice)
     for (int i = 0; i < num_vrfs; ++i) {
         cleanup_vrf_instance(&vrf_instances[i]);
     }
