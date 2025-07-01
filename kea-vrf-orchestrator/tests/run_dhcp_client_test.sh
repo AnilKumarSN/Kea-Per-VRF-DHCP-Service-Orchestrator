@@ -1,6 +1,38 @@
 #!/bin/bash
 # Test script to simulate a DHCP client requesting an IP from a Kea server
 # running in a VRF-specific namespace.
+#
+# CURRENT SCOPE:
+# This script primarily tests the ability of a Kea instance, running in its own
+# namespace and configured by the orchestrator (or manually), to serve DHCP leases
+# to a client that is directly connected to the VRF network segment.
+# It achieves this by creating a client namespace and a veth pair where one end
+# is in the client namespace and the other end is enslaved to the target VRF.
+#
+# LIMITATION FOR TESTING ORCHESTRATOR'S ACTIVE RELAY:
+# This script, in its current form, DOES NOT directly test the orchestrator's
+# active DHCP relay functionality (i.e., the C code listening on `client_listen_fd`
+# and forwarding packets). This is because the client's veth (`CLIENT_VETH_TO_VRF`)
+# is put directly into the VRF, so packets flow via kernel routing to Kea's veth,
+# bypassing the orchestrator's main relay socket.
+#
+# TO TEST THE ORCHESTRATOR'S ACTIVE RELAY:
+# You would need a different setup:
+# 1. Orchestrator running and its `client_listen_fd` listening on an interface
+#    (e.g., a bridge `br-clients` or a physical interface `ethX`) in the root namespace.
+# 2. A DHCP client (e.g., in a VM, another physical machine, or a namespace) connected
+#    to that same network segment (e.g., `br-clients` or `ethX`).
+# 3. The orchestrator's relay logic would then pick up the client's broadcast from
+#    `client_listen_fd` and relay it to the target Kea instance (currently vrf_instances[0]).
+#
+# Example for testing active relay (conceptual):
+#   - Create a bridge in root ns: `sudo ip link add name br-clients type bridge && sudo ip link set br-clients up`
+#   - Ensure orchestrator's `client_listen_fd` can receive broadcasts from `br-clients`.
+#     (Binding to INADDR_ANY usually suffices if `br-clients` has an IP or is part of routing).
+#   - In this script, instead of `sudo ip link set "$CLIENT_VETH_TO_VRF" master "$VRF_NAME"`,
+#     you would do `sudo ip link set "$CLIENT_VETH_TO_VRF" master br-clients` (or just bring it up
+#     if `br-clients` is the general client network and the orchestrator listens there).
+#   - This setup change is NOT implemented in this script by default.
 
 set -e
 # set -x # Uncomment for debugging
