@@ -17,18 +17,19 @@ The system consists of a central C-based orchestrator application that leverages
 *   **Kea Instance Management:** Launches and manages Kea DHCPv4 server instances within these isolated namespaces. Monitors Kea process status (basic).
 *   **Inter-Namespace Communication:** Sets up veth pairs for communication between the orchestrator (root namespace) and each Kea instance.
 *   **Configuration Generation:** Generates Kea DHCPv4 configuration files from a template (`config/kea-dhcp4-template.conf`), customizing them for each VRF.
-*   **Basic DHCPv4 Relay:**
-    *   The orchestrator can relay DHCPv4 packets between a client network and Kea instances.
-    *   Listens for client DHCP broadcasts on `INADDR_ANY` (port 67).
-    *   Forwards requests to the appropriate Kea instance (currently limited to the *first managed VRF*) after setting the `giaddr`.
-    *   Relays replies from Kea back to the client network (broadcast on port 68).
+*   **Targeted Multi-VRF DHCPv4 Relay:**
+    *   The orchestrator relays DHCPv4 packets from specified client-facing network interfaces to their mapped VRF's Kea instance.
+    *   Client-facing interfaces and their mappings to VRFs (including the interface's IP for `giaddr`) are configured via the `-m <if_name>:<vrf_name>:<if_ip>` command-line argument. Multiple mappings can be specified.
+    *   Creates a dedicated listening socket for each mapped client-facing interface, bound to its specified IP and DHCP server port (67).
+    *   Sets the `giaddr` in DHCP requests to the IP of the ingress client-facing interface.
+    *   Uses `sendmsg` with `IP_PKTINFO` to ensure DHCP replies are sourced from the correct client-facing interface IP, enabling proper operation across multiple network segments.
 
 ## Current Limitations
 
-*   **Single VRF Relay Target:** The DHCP relay logic currently forwards all client requests to the Kea instance of the first detected/managed VRF (`vrf_instances[0]`). It does not yet map clients to specific VRFs based on, for example, the client's ingress interface.
-*   **DHCPv6 Support:** While Kea DHCPv6 templates exist, the orchestrator's C code primarily focuses on DHCPv4 setup, relay, and Kea instance management.
-*   **Error Handling:** Error handling and recovery mechanisms can be further enhanced.
-*   **Configuration:** Orchestrator behavior (like client interface bindings for relay) is not yet configurable via an external file.
+*   **Static Mappings:** Interface-to-VRF mappings are currently provided only at startup via command-line arguments. They cannot be updated dynamically while the orchestrator is running.
+*   **DHCPv6 Support:** Relay and Kea management logic primarily focuses on DHCPv4.
+*   **Error Handling:** Can be further enhanced for production robustness.
+*   **Advanced Configuration:** Lacks a dedicated configuration file for more complex settings beyond command-line arguments.
 
 ## Project Structure
 
@@ -53,9 +54,20 @@ The system consists of a central C-based orchestrator application that leverages
 make
 ```
 
-**Running (example):**
+**Running (example with interface mappings):**
 ```bash
-sudo ./build/orchestrator
+# Example: Map interface eth1 (IP 192.168.1.10) to vrf-red
+# and interface eth2 (IP 10.0.0.10) to vrf-blue
+sudo ./build/orchestrator \
+    -m eth1:vrf-red:192.168.1.10 \
+    -m eth2:vrf-blue:10.0.0.10
 ```
 
-Refer to `doc/USER_GUIDE.md` for more detailed instructions.
+**Testing Dynamic VRF Add/Delete:**
+While the orchestrator is running (after initial setup with any `-m` mappings):
+1.  **Add a new VRF:** `sudo ip link add vrf-green type vrf table 1003 && sudo ip link set dev vrf-green up`
+    *   The orchestrator should detect `vrf-green` via Netlink and set up its namespace and Kea instance. If a `-m` mapping previously specified `vrf-green`, the relay for that interface should now become active.
+2.  **Delete an existing VRF:** `sudo ip link del vrf-red`
+    *   The orchestrator should detect the deletion, clean up resources for `vrf-red`, and any `-m` mapping for `vrf-red` will become inactive for relay.
+
+Refer to `doc/USER_GUIDE.md` for more detailed instructions on setup, prerequisites, and advanced testing.
