@@ -10,41 +10,43 @@ The system is composed of a central C-based Orchestrator application, standard K
 
 *   **Orchestrator (Core C Application):**
     *   Runs in the host's root network namespace.
+    *   **Interface-to-VRF Mappings Configuration:**
+        *   **Initial Setup:** Mappings from client-facing network interfaces to VRFs (including the orchestrator's IP on that interface) are configured at startup.
+            *   Primarily via a configuration file specified with `-c <filepath>`. Each line in the file defines a mapping: `<if_name>:<vrf_name>:<if_ip>`.
+            *   As a fallback, or if no config file is given, mappings can be provided via multiple `-m <if_name>:<vrf_name>:<if_ip>` command-line arguments. If `-c` is used, `-m` arguments are ignored.
+        *   **Runtime Reload (SIGHUP):** Receiving a `SIGHUP` signal triggers the orchestrator to re-parse the configuration file specified by `-c`.
+            *   The existing mappings are compared to the newly parsed ones.
+            *   Sockets for removed mappings are closed.
+            *   Sockets for new mappings are created and bound.
+            *   Sockets for mappings where the IP address changed are recreated.
+            *   Mappings to VRFs are re-resolved against currently active VRF instances.
+        *   These mappings are stored internally in an array of `if_vrf_map_t` structs.
     *   **VRF Discovery & Management:**
         *   **Initial Discovery:** At startup, parses `ip link show type vrf` output to discover pre-existing VRFs.
         *   **Dynamic Runtime Management (Netlink):**
             *   Opens a Netlink socket (`NETLINK_ROUTE`) and subscribes to `RTMGRP_LINK` messages.
             *   Listens for `RTM_NEWLINK` and `RTM_DELLINK` messages concerning interfaces of type "vrf".
-            *   Dynamically adds newly created VRFs: sets up their namespace, veth pair, Kea instance, and communication sockets.
-            *   Dynamically removes deleted VRFs: cleans up all associated resources (Kea process, namespace, veth, sockets).
-    *   **Lifecycle Management (per VRF):**
-        *   Creates a dedicated network namespace (e.g., `vrf-red_ns`).
-        *   Creates a veth pair: one end in the root namespace (`v<name>_h`), the other moved into the VRF's namespace (`v<name>_ns`).
-        *   Assigns IP addresses from a private range (e.g., `169.254.x.x/30`) to both ends of the veth pair.
-        *   Launches Kea DHCPv4 (`kea-dhcp4`) process inside the namespace using `ip netns exec`.
-        *   Generates Kea configuration files from a template (`config/kea-dhcp4-template.conf`), ensuring Kea binds to the veth interface within its namespace and uses VRF-specific log/lease files.
-    *   **Configuration of Client-Facing Interfaces:**
-        *   The orchestrator accepts command-line arguments (`-m <if_name>:<vrf_name>:<if_ip>`) to map client-facing network interfaces (identified by `if_name`) to target VRF names. The `if_ip` is the IP address of the orchestrator on that client-facing segment.
-        *   These mappings are stored in an `if_vrf_map_t` structure, which also holds the listening socket FD for that interface and the resolved index of the target VRF instance.
+            *   Dynamically adds newly created VRFs: sets up their namespace, veth pair, Kea instance, and communication sockets. Updates `if_vrf_map_t` entries if a newly active VRF matches a configured mapping.
+            *   Dynamically removes deleted VRFs: cleans up all associated resources. Updates `if_vrf_map_t` entries by invalidating their `vrf_idx` if their mapped VRF is removed.
+    *   **Lifecycle Management (per VRF):** (Largely unchanged, details omitted for brevity here - see previous versions)
+        *   Manages namespace, veth pair, Kea process, and Kea configuration generation.
     *   **Runtime Dispatching (Targeted Multi-VRF DHCPv4 Relay):**
         *   The `listen_and_dispatch_packets()` function implements the targeted DHCPv4 relay.
-        *   **Per-Interface Client Packet Listeners:** For each mapping provided via command-line, a dedicated UDP socket (`if_vrf_map_t.listen_fd`) is created. This socket is bound to the specified `if_ip` for that interface and the DHCP server port (67), with `SO_BROADCAST` enabled.
-        *   **Kea Communication Sockets:** For each managed VRF, a dedicated UDP socket (`vrf_instance_t.kea_comm_fd`) is created and bound to its host-side veth IP (e.g., `169.254.x.1:67`).
-        *   **I/O Multiplexing:** Uses `select()` to monitor all active per-interface client listener sockets, all active `kea_comm_fd`s, and the `netlink_fd`.
+        *   **Per-Interface Client Packet Listeners:** For each active mapping (from config file or `-m` args), a dedicated UDP socket (`if_vrf_map_t.listen_fd`) is created, bound to the specified `if_ip` for that interface and DHCP server port (67), with `SO_BROADCAST` enabled.
+        *   **Kea Communication Sockets:** For each managed VRF, a dedicated UDP socket (`vrf_instance_t.kea_comm_fd`) is bound to its host-side veth IP.
+        *   **I/O Multiplexing:** Uses `select()` to monitor all active client listener sockets, Kea communication sockets, and the Netlink socket. A `reload_config_flag` (set by SIGHUP handler) is checked within the loop to trigger mapping reloads.
         *   **Packet Processing (Client to Kea):**
-            *   When a DHCP BOOTREQUEST is received on a specific per-interface client listener socket:
-                *   The orchestrator identifies the `if_vrf_map_t` entry associated with the receiving socket.
-                *   It uses the `vrf_name` (or resolved `vrf_idx`) from the mapping to find the target `vrf_instance_t`.
-                *   The `giaddr` field in the DHCP packet is set to the `if_ip` of the receiving client-facing interface (from `if_vrf_map_t.if_ip`).
-                *   The packet is sent via the target VRF's `kea_comm_fd` to the Kea instance's IP (`veth_ns_ip`) on port 67.
+            *   When a DHCP BOOTREQUEST is received on a per-interface client listener socket:
+                *   The associated `if_vrf_map_t` entry identifies the target VRF (via `vrf_idx`).
+                *   `giaddr` is set to the `if_ip` of this client-facing interface.
+                *   The packet is sent via the target VRF's `kea_comm_fd` to its Kea instance.
         *   **Packet Processing (Kea to Client):**
             *   When a DHCP BOOTREPLY is received on a VRF's `kea_comm_fd`:
-                *   The orchestrator determines which `if_vrf_map_t` entry corresponds to this VRF (assuming a VRF is mapped from at most one client interface for relay replies, or using other correlation if needed).
-                *   The reply packet is sent using `sendmsg` via the client-facing socket (`if_vrf_map_t.listen_fd`) of the original ingress interface.
-                *   `IP_PKTINFO` is used with `sendmsg` to set the source IP of the reply packet to the `if_ip` of that client-facing interface, ensuring it appears to originate from the correct segment.
-                *   The destination is typically broadcast or unicast to `yiaddr` based on packet flags and content.
-*   **Linux Network Namespace:** Provides network stack isolation for each Kea instance. Managed via `ip netns` commands.
-*   **veth Pair:** Enables IP communication between the Orchestrator (root namespace) and Kea instances (VRF namespaces).
+                *   The orchestrator finds the `if_vrf_map_t` entry whose `vrf_idx` matches the replying VRF.
+                *   The reply is sent using `sendmsg` via the corresponding client-facing socket (`if_vrf_map_t.listen_fd`).
+                *   `IP_PKTINFO` is used to set the source IP of the reply to the `if_ip` of that client-facing interface.
+*   **Linux Network Namespace:** (Unchanged)
+*   **veth Pair:** (Unchanged)
 *   **Netlink Socket:** Used by the Orchestrator to receive real-time notifications about network interface additions/deletions, enabling dynamic VRF management.
 *   **Kea Server Instance:** Standard Kea binaries running in their respective namespaces, configured by the Orchestrator.
 
