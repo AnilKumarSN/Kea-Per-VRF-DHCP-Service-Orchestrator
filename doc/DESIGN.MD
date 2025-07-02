@@ -12,39 +12,40 @@ The system is composed of a central C-based Orchestrator application, standard K
     *   Runs in the host's root network namespace.
     *   **Interface-to-VRF Mappings Configuration:**
         *   **Initial Setup:** Mappings from client-facing network interfaces to VRFs (including the orchestrator's IP on that interface, used as `giaddr` and for sourcing replies) are configured at startup.
-            *   This is primarily done via a configuration file (e.g., `orchestrator.conf`) specified with the `-c <filepath>` command-line option. Each line in the file defines a mapping in the format: `<if_name>:<vrf_name>:<if_ip>`. Comments (`#`) and empty lines are ignored.
-            *   Alternatively, if no configuration file is specified, mappings can be provided using multiple `-m <if_name>:<vrf_name>:<if_ip>` command-line arguments. If `-c` is used, any `-m` arguments are ignored for the initial setup.
-        *   **Runtime Reload (SIGHUP):** When the orchestrator receives a `SIGHUP` signal, it attempts to re-parse the configuration file (if one was specified at startup via `-c`).
-            *   The new set of mappings is compared against the current active mappings.
-            *   Listening sockets for mappings that are removed or whose IP addresses have changed are closed.
-            *   Listening sockets for new mappings or those with changed IPs are created (or recreated) and bound.
+            *   This is primarily done via a configuration file (e.g., `orchestrator.conf`) specified with the `-c <filepath>` command-line option. Each line in the file defines a mapping in the format: `<if_name>:<vrf_name>:<if_ip>`. Comments (`#`) and empty lines are ignored. The orchestrator parses this file using `parse_config_file()`.
+            *   Alternatively, if no configuration file is specified, mappings can be provided using multiple `-m <if_name>:<vrf_name>:<if_ip>` command-line arguments, parsed by `process_cli_mappings()`. If `-c` is used, any `-m` arguments are ignored for the initial setup.
+        *   **Runtime Reload (SIGHUP):** When the orchestrator receives a `SIGHUP` signal (handler `sighup_handler` sets `reload_config_flag`), the `listen_and_dispatch_packets()` loop calls `reload_interface_mappings()`.
+            *   `reload_interface_mappings()` re-parses the configuration file.
+            *   It compares the new set of mappings against the current active ones.
+            *   Listening sockets (`if_vrf_map_t.listen_fd`) for mappings that are removed or whose IP addresses have changed are closed.
+            *   Sockets for new mappings or those with changed IPs are created (or recreated) using a helper `setup_if_map_socket()`.
             *   Mappings that remain unchanged (same interface, VRF, and IP) retain their existing listening sockets.
-            *   The internal `vrf_idx` (linking a map to an active VRF instance) is re-resolved for all current mappings after the reload.
-        *   These mappings are stored internally in an array of `if_vrf_map_t` structs. Each struct holds the interface name, its IP (string and binary), the target VRF name, the listening socket FD for that interface, and the resolved index of the target `vrf_instance_t`.
+            *   The internal `vrf_idx` (linking a map to an active VRF instance) is re-resolved for all current mappings by `resolve_vrf_indices_for_maps()` after the reload and also after dynamic VRF changes.
+        *   These mappings are stored internally in a global array `if_vrf_map_t if_vrf_maps[]`.
     *   **VRF Discovery & Management:**
-        *   **Initial Discovery:** At startup, parses `ip link show type vrf` output to discover pre-existing VRFs.
+        *   **Initial Discovery:** At startup, `discover_vrfs()` parses `ip link show type vrf` output to discover pre-existing VRFs.
         *   **Dynamic Runtime Management (Netlink):**
-            *   A Netlink socket (`NETLINK_ROUTE`) subscribes to `RTMGRP_LINK` messages.
-            *   On `RTM_NEWLINK` for a new VRF interface: the orchestrator sets up its namespace, veth pair, Kea instance, and Kea communication socket. It then re-resolves `vrf_idx` for all configured interface mappings to link them to this newly active VRF if applicable.
-            *   On `RTM_DELLINK` for a managed VRF interface: the orchestrator cleans up all associated resources (Kea process, namespace, veth, sockets) and invalidates the `vrf_idx` in any interface mappings that pointed to it.
-    *   **Lifecycle Management (per VRF):** (Details largely unchanged from previous versions: involves creating network namespaces, veth pairs, launching Kea with templated configurations.)
+            *   A Netlink socket (`netlink_fd`) subscribes to `RTMGRP_LINK` messages.
+            *   On `RTM_NEWLINK` for a new VRF interface: the orchestrator sets up its namespace, veth pair, Kea instance (`launch_kea_in_namespace`), and Kea communication socket (`setup_kea_communication_socket`). It then calls `resolve_vrf_indices_for_maps()` to link any relevant configured interface mappings to this newly active VRF.
+            *   On `RTM_DELLINK` for a managed VRF interface: the orchestrator cleans up all associated resources (`cleanup_vrf_instance`) and calls `resolve_vrf_indices_for_maps()` to invalidate the `vrf_idx` in any interface mappings that pointed to the removed VRF.
+    *   **Lifecycle Management (per VRF):** Involves `setup_namespace_for_vrf`, `launch_kea_in_namespace`, `setup_kea_communication_socket`, and `cleanup_vrf_instance`. Kea configurations are generated from templates.
     *   **Runtime Dispatching (Targeted Multi-VRF DHCPv4 Relay):**
         *   The `listen_and_dispatch_packets()` function contains the main `select()` loop.
         *   **Per-Interface Client Packet Listeners:** For each active and valid mapping, a dedicated UDP socket (`if_vrf_map_t.listen_fd`) is bound to the mapping's specified `if_ip` and DHCP server port (67). `SO_BROADCAST` and `SO_REUSEADDR` are enabled.
         *   **Kea Communication Sockets:** For each managed VRF, a UDP socket (`vrf_instance_t.kea_comm_fd`) is bound to its host-side veth IP and DHCP server port (67).
-        *   **I/O Multiplexing:** `select()` monitors all active client listener sockets, Kea communication sockets, and the Netlink socket. A `reload_config_flag` (set by the SIGHUP handler) is checked within this loop to trigger the `reload_interface_mappings()` function.
+        *   **I/O Multiplexing:** `select()` monitors all active client listener sockets, Kea communication sockets, and the Netlink socket. The `reload_config_flag` is checked to trigger `reload_interface_mappings()`.
         *   **Packet Processing (Client to Kea):**
             *   When a DHCP BOOTREQUEST is received on a per-interface client listener socket:
-                *   The orchestrator uses the `if_vrf_map_t` associated with the socket to identify the target `vrf_instance_t` (via the resolved `vrf_idx`).
+                *   The orchestrator uses the `if_vrf_map_t` associated with the socket to identify the target `vrf_instance_t` (via `vrf_idx`).
                 *   The `giaddr` field in the DHCP packet is set to the `if_ip` of this client-facing interface.
                 *   The packet is sent via the target VRF's `kea_comm_fd` to its Kea instance.
         *   **Packet Processing (Kea to Client):**
             *   When a DHCP BOOTREPLY is received on a VRF's `kea_comm_fd`:
                 *   The orchestrator finds the `if_vrf_map_t` entry whose `vrf_idx` matches the replying VRF.
-                *   The reply is sent using `sendmsg` via the client-facing socket of that mapping (`if_vrf_map_t.listen_fd`).
+                *   The reply is sent using `sendmsg` via the client-facing socket of that mapping.
                 *   `IP_PKTINFO` is used with `sendmsg` to set the source IP of the reply packet to the `if_ip` of that client-facing interface.
-*   **Linux Network Namespace:** (Unchanged from previous description: provides isolation, managed via `ip netns`).
-*   **veth Pair:** (Unchanged from previous description: inter-namespace communication link).
+*   **Linux Network Namespace:** (Unchanged: provides isolation, managed via `ip netns`).
+*   **veth Pair:** (Unchanged: inter-namespace communication link).
 *   **Netlink Socket:** Used by the Orchestrator to receive real-time notifications about network interface additions/deletions, enabling dynamic VRF management.
 *   **Kea Server Instance:** Standard Kea binaries running in their respective namespaces, configured by the Orchestrator.
 
@@ -82,20 +83,19 @@ Assumptions:
 ## 4. Key Design Decisions & Considerations
 
 *   **Configuration of Mappings (Startup and Runtime):**
-    *   Interface-to-VRF mappings are now primarily managed via a configuration file (`-c <filepath>`). This allows for more persistent and manageable configurations compared to only command-line arguments.
-    *   The `SIGHUP` signal provides a mechanism for runtime reloading of these mappings, offering flexibility without service interruption for existing, unchanged mappings. Sockets for removed or modified mappings are appropriately handled.
-    *   Command-line `-m` arguments serve as a fallback for initial configuration if no config file is specified.
-*   **Per-Interface Sockets for Client Traffic:** Dedicated listening sockets per mapped client-facing interface ensure that traffic is correctly attributed to its ingress segment and mapped VRF. Binding these sockets to specific interface IPs is crucial.
-*   **`giaddr` Setting:** Setting `giaddr` to the IP of the actual client-facing interface (from the mapping) is standard relay agent behavior.
-*   **Reply Source IP (`IP_PKTINFO`):** Essential for multi-homed relays to ensure replies originate from the correct network segment IP.
-*   **Netlink for VRF Dynamics:** Integration of Netlink for VRF add/delete events allows the orchestrator to adapt its internal state (active VRF instances and their linkage to interface mappings) dynamically.
-*   **Single-Threaded Model with `select()`:** The current architecture uses a single thread with `select()` for I/O multiplexing across DHCP sockets and the Netlink socket. SIGHUP flag is checked within this loop. This is simpler to manage initially but might have limitations under very high load or if some operations become blocking.
-*   **Error Handling:** Basic error logging is in place. Robustness can be improved with more specific error handling for socket operations, file parsing, and process management.
+    *   Interface-to-VRF mappings are managed via a configuration file (`-c <filepath>`) and/or command-line arguments (`-m`). The config file method is prioritized if specified.
+    *   The `SIGHUP` signal enables runtime reloading of mappings from the configuration file. This involves parsing the file, comparing new mappings to existing ones, and managing associated listening sockets (closing old, creating new, preserving unchanged).
+*   **Per-Interface Sockets for Client Traffic:** Dedicated UDP listening sockets are created for each client-facing interface defined in the mappings, bound to the specified IP of that interface.
+*   **`giaddr` Setting:** For requests relayed to Kea, the `giaddr` is set to the IP address of the client-facing interface that received the original client broadcast.
+*   **Reply Source IP (`IP_PKTINFO`):** DHCP replies from Kea are forwarded to clients using `sendmsg` with `IP_PKTINFO` to ensure the reply packet's source IP is that of the correct client-facing interface.
+*   **Dynamic VRF Management (Netlink):** Netlink `RTMGRP_LINK` messages are used to detect the addition or deletion of VRF interfaces at runtime. The orchestrator dynamically creates/destroys the necessary per-VRF namespaces, Kea instances, and communication channels. Interface mapping `vrf_idx` fields are updated upon these events.
+*   **Single-Threaded Model with `select()`:** All I/O (DHCP client sockets, Kea communication sockets, Netlink socket) and event handling (SIGHUP flag check) are managed within a single thread using `select()`.
+*   **Error Handling:** Basic error logging is implemented. More comprehensive error recovery and resilience strategies are future work.
 
 ## 5. Future Enhancements
 
 *   **DHCPv6 Relay Support.**
-*   **Full Netlink Integration for network setup/teardown** (replacing all `ip` command calls for namespace and veth management).
+*   **Full Netlink Integration for network setup/teardown** (replacing all `ip` command calls).
 *   **Advanced Kea Configuration Management.**
 *   **Orchestrator API/CLI.**
 *   **Improved Kea Process Monitoring.**
