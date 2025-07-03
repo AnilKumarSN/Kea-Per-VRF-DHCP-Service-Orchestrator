@@ -4,29 +4,28 @@
 
 This project provides a DHCP service orchestrator designed to manage multiple Kea DHCP server instances, each dedicated to a specific VRF (Virtual Routing and Forwarding) domain on a Linux system. This allows for isolated DHCP services for different network segments or tenants.
 
-The system consists of a central C-based orchestrator application that leverages Linux network namespaces, veth pairs, and Netlink sockets to achieve its goals.
+The system consists of a central C-based orchestrator application that leverages Linux network namespaces, veth pairs, Netlink sockets, and POSIX threads to achieve its goals. It now operates with a multi-threaded architecture for improved responsiveness and task separation.
 
 ## Core Features
 
+*   **Multi-Threaded Architecture:**
+    *   **Main Thread:** Handles initialization, signal management (SIGINT, SIGTERM, SIGHUP), thread creation, configuration reloads (triggered by SIGHUP), and graceful shutdown.
+    *   **Packet Dispatching Thread:** Manages a `select()` loop for all DHCP packet I/O (client-facing listeners and Kea communication sockets), performing the relay logic. It's notified of configuration changes via a pipe.
+    *   **Netlink Monitoring Thread:** Dedicated to listening for VRF interface additions/deletions via Netlink. Updates shared VRF data structures (thread-safe) and signals the dispatch thread.
 *   **Dynamic VRF Discovery & Management:**
     *   Discovers existing VRF interfaces at startup.
-    *   Utilizes Netlink (`RTMGRP_LINK`) to dynamically detect VRF interfaces being added or removed at runtime.
-    *   Automatically sets up namespaces, veth pairs, and Kea instances for newly added VRFs.
-    *   Cleans up resources for VRFs that are removed.
-*   **Namespace Isolation:** Creates a dedicated Linux network namespace for each managed VRF, ensuring isolated DHCP services.
-*   **Kea Instance Management:** Launches and manages Kea DHCPv4 server instances within these isolated namespaces. Monitors Kea process status (basic).
-*   **Inter-Namespace Communication:** Sets up veth pairs for communication between the orchestrator (root namespace) and each Kea instance.
-*   **Configuration Generation:** Generates Kea DHCPv4 configuration files from a template (`config/kea-dhcp4-template.conf`), customizing them for each VRF.
+    *   Utilizes Netlink (`RTMGRP_LINK`) in a dedicated thread to dynamically detect VRF interface changes at runtime.
+    *   Automatically sets up/tears down namespaces, veth pairs, and Kea instances for VRFs.
+*   **Namespace Isolation:** Creates a dedicated Linux network namespace for each managed VRF.
+*   **Kea Instance Management:** Launches and manages Kea DHCPv4 server instances. Basic Kea process status monitoring is included.
 *   **Targeted Multi-VRF DHCPv4 Relay with Dynamic Mapping Configuration:**
     *   Relays DHCPv4 packets from specified client-facing network interfaces to their mapped VRF's Kea instance.
     *   **Configuration:**
-        *   Interface-to-VRF mappings (`<if_name>:<vrf_name>:<if_ip>`) are primarily loaded from a configuration file specified using the `-c <filepath>` command-line option.
-        *   Example line in config file: `eth0:vrf-red:192.168.1.1`
-        *   If `-c` is not used, mappings can be provided via multiple `-m <map_string>` arguments as a fallback.
-        *   **SIGHUP Reload:** Sending a `SIGHUP` signal to the orchestrator process triggers a reload of mappings from the specified configuration file, allowing for runtime updates (add, remove, modify mappings) without a full restart.
-    *   Creates a dedicated listening socket for each mapped client-facing interface, bound to its specified IP.
-    *   Sets `giaddr` in DHCP requests to the IP of the ingress client-facing interface.
-    *   Uses `sendmsg` with `IP_PKTINFO` for DHCP replies to ensure correct source IP.
+        *   Interface-to-VRF mappings are primarily loaded from a configuration file (`-c <filepath>`).
+        *   Fallback to command-line `-m <map_string>` arguments if no config file is given.
+        *   **SIGHUP Reload:** Mappings can be reloaded from the config file at runtime by sending `SIGHUP` to the orchestrator.
+    *   Creates dedicated listening sockets for each client-facing interface.
+    *   Correctly sets `giaddr` and uses `sendmsg` with `IP_PKTINFO` for replies.
 
 ## Current Limitations
 

@@ -2,8 +2,8 @@
 
 # Compiler and Linker
 CC = gcc
-CFLAGS = -Wall -Wextra -g -std=c11 # -pthread (if using pthreads directly)
-LDFLAGS = # Add libraries here if needed, e.g. -lmnl
+CFLAGS = -Wall -Wextra -g -std=c11 -pthread
+LDFLAGS = -pthread # Add libraries here if needed, e.g. -lmnl
 
 # Source files
 SRCS = src/orchestrator.c

@@ -20,6 +20,7 @@
 #include <getopt.h>      // For getopt_long()
 #include <ctype.h>       // For isspace()
 #include <signal.h>      // For SIGHUP, sig_atomic_t, signal()
+#include <pthread.h>     // For threading
 
 // Basic logging macros
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
@@ -79,6 +80,12 @@ int netlink_fd = -1;       // Socket for receiving Netlink RTMGRP_LINK messages
 #define MAX_IF_VRF_MAPS 10 // Max number of interface-to-VRF mappings
 
 volatile sig_atomic_t reload_config_flag = 0; // Flag for SIGHUP, set by sighup_handler
+volatile sig_atomic_t global_shutdown_flag = 0; // Flag for graceful shutdown
+
+pthread_mutex_t vrf_list_mutex;
+pthread_mutex_t map_list_mutex;
+int notify_pipe[2] = {-1, -1}; // Pipe for waking up dispatch thread [0]=read, [1]=write
+
 
 typedef struct {
     char if_name[IFNAMSIZ];
@@ -104,6 +111,9 @@ int discovered_vrf_count = 0;
 // Forward declaration
 int setup_if_map_socket(if_vrf_map_t *map_entry);
 void resolve_vrf_indices_for_maps();
+int reload_interface_mappings();
+void* dispatch_thread_func(void *arg); // Renamed from listen_and_dispatch_packets
+void* netlink_thread_func(void *arg);  // New thread function
 
 
 int run_command(const char *command, char *args[]) {
@@ -170,6 +180,9 @@ int setup_namespace_for_vrf(vrf_instance_t *vrf, int vrf_idx_for_ip) {
     snprintf(vrf->veth_host_ip, sizeof(vrf->veth_host_ip), "169.254.%d.1", vrf_idx_for_ip + 1);
     snprintf(vrf->veth_ns_ip, sizeof(vrf->veth_ns_ip), "169.254.%d.2", vrf_idx_for_ip + 1);
     vrf->kea_comm_fd = -1;
+    vrf->kea4_pid = 0; // Initialize PIDs
+    vrf->kea6_pid = 0;
+
 
     char *cmd_netns_add[] = {"ip", "netns", "add", vrf->ns_name, NULL};
     if (run_command("ip", cmd_netns_add) != 0) {
@@ -273,47 +286,73 @@ int launch_kea_in_namespace(vrf_instance_t *vrf, int current_vrf_count_for_subne
     return 0;
 }
 
-void listen_and_dispatch_packets() {
-    LOG_INFO("Starting packet dispatching loop...");
+// Renamed from listen_and_dispatch_packets
+void* dispatch_thread_func(void *arg) {
+    (void)arg; // Not using argument for now
+    LOG_INFO("Packet dispatching thread started.");
     fd_set read_fds;
     int max_fd;
 
-    while(1) {
+    // This loop should also check global_shutdown_flag
+    while(!global_shutdown_flag) {
         if (reload_config_flag) {
-            LOG_INFO("Reload config flag is set. Attempting to reload interface mappings...");
-            // reload_interface_mappings(config_file_path, if_vrf_maps, &num_if_vrf_maps, MAX_IF_VRF_MAPS); // Step 4
+            LOG_INFO("Dispatch Thread: Reload config flag detected.");
+            pthread_mutex_lock(&map_list_mutex);
+            reload_interface_mappings();
+            pthread_mutex_unlock(&map_list_mutex);
             reload_config_flag = 0;
         }
 
         FD_ZERO(&read_fds);
         max_fd = 0;
 
+        pthread_mutex_lock(&map_list_mutex);
         for (int i = 0; i < num_if_vrf_maps; ++i) {
             if (if_vrf_maps[i].listen_fd != -1) {
                 FD_SET(if_vrf_maps[i].listen_fd, &read_fds);
                 if (if_vrf_maps[i].listen_fd > max_fd) max_fd = if_vrf_maps[i].listen_fd;
             }
         }
+        pthread_mutex_unlock(&map_list_mutex);
+
+        pthread_mutex_lock(&vrf_list_mutex);
         for (int i = 0; i < num_vrfs; ++i) {
             if (vrf_instances[i].kea_comm_fd != -1) {
                 FD_SET(vrf_instances[i].kea_comm_fd, &read_fds);
                 if (vrf_instances[i].kea_comm_fd > max_fd) max_fd = vrf_instances[i].kea_comm_fd;
             }
         }
-        if (netlink_fd != -1) {
-            FD_SET(netlink_fd, &read_fds);
-            if (netlink_fd > max_fd) max_fd = netlink_fd;
+        pthread_mutex_unlock(&vrf_list_mutex);
+
+        // Add notify_pipe[0] to select set
+        if (notify_pipe[0] != -1) {
+            FD_SET(notify_pipe[0], &read_fds);
+            if (notify_pipe[0] > max_fd) max_fd = notify_pipe[0];
+        }
+        // We don't add netlink_fd here anymore, it's in its own thread.
+
+        if (max_fd == 0 && notify_pipe[0] == -1) { // If no sockets and no pipe to wake us
+            LOG_DEBUG("Dispatch Thread: No FDs to monitor. Sleeping briefly.");
+            usleep(100000); // Sleep 100ms to avoid busy loop if pipe also closed
+            continue;
+        }
+        if (max_fd == 0 && notify_pipe[0] != -1) { // Only pipe is active
+             max_fd = notify_pipe[0]; // ensure max_fd is at least the pipe
         }
 
-        if (max_fd == 0) { LOG_DEBUG("No FDs to monitor. Sleeping."); sleep(1); continue; }
 
-        struct timeval timeout = {.tv_sec = 5, .tv_usec = 0}; // Check Kea status every 5s
+        struct timeval timeout = {.tv_sec = 1, .tv_usec = 0}; // Shorter timeout for responsiveness
         int activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
 
-        if (activity < 0 && errno != EINTR) { LOG_ERROR("select() error"); sleep(1); continue; }
+        if (activity < 0 && errno != EINTR) { LOG_ERROR("Dispatch Thread: select() error"); usleep(100000); continue; }
+
+        if (global_shutdown_flag) break; // Check flag after select
 
         if (activity == 0) { // Timeout
-            LOG_DEBUG("select() timed out. Checking Kea status.");
+            LOG_DEBUG("Dispatch Thread: select() timed out.");
+            // Kea process status check can be moved to main thread or a dedicated monitor thread later
+            // For now, keeping it here but under lock.
+            pthread_mutex_lock(&vrf_list_mutex);
             for (int i = 0; i < num_vrfs; ++i) {
                 if (vrf_instances[i].kea4_pid > 0) {
                     int status;
@@ -321,15 +360,27 @@ void listen_and_dispatch_packets() {
                     if (result == vrf_instances[i].kea4_pid) {
                         LOG_ERROR("Kea for VRF %s (PID %d) exited.", vrf_instances[i].name, vrf_instances[i].kea4_pid);
                         vrf_instances[i].kea4_pid = 0;
-                        // TODO: More robust handling: cleanup/restart
                     } else if (result == -1 && errno != ECHILD) {
                          LOG_ERROR("waitpid error for Kea VRF %s (PID %d)", vrf_instances[i].name, vrf_instances[i].kea4_pid);
                     }
                 }
             }
+            pthread_mutex_unlock(&vrf_list_mutex);
             continue;
         }
 
+        // Check notify_pipe first
+        if (notify_pipe[0] != -1 && FD_ISSET(notify_pipe[0], &read_fds)) {
+            LOG_DEBUG("Dispatch Thread: Notified via pipe. Rebuilding fd_set.");
+            char dummy_buf[1];
+            ssize_t n = read(notify_pipe[0], dummy_buf, sizeof(dummy_buf)); // Consume the byte
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOG_ERROR("Error reading from notify_pipe[0]");
+            }
+            // The fd_set will be rebuilt at the start of the loop.
+        }
+
+        pthread_mutex_lock(&map_list_mutex); // Lock before accessing if_vrf_maps
         for (int map_idx = 0; map_idx < num_if_vrf_maps; ++map_idx) {
             if (if_vrf_maps[map_idx].listen_fd != -1 && FD_ISSET(if_vrf_maps[map_idx].listen_fd, &read_fds)) {
                 char buffer[DHCP_PACKET_BUFFER_SIZE];
@@ -343,8 +394,10 @@ void listen_and_dispatch_packets() {
                 } else {
                     LOG_INFO("Rx %zd bytes from client %s:%d on if %s", len, inet_ntoa(client_src_addr.sin_addr), ntohs(client_src_addr.sin_port), if_vrf_maps[map_idx].if_name);
                     dhcp_packet_t *dhcp_req = (dhcp_packet_t *)buffer;
-                    if (dhcp_req->op == 1) { // BOOTREQUEST
+                    if (dhcp_req->op == 1) {
                         int target_vrf_idx = if_vrf_maps[map_idx].vrf_idx;
+
+                        pthread_mutex_lock(&vrf_list_mutex); // Lock vrf_instances
                         if (target_vrf_idx != -1 && target_vrf_idx < num_vrfs) {
                             vrf_instance_t *target_vrf = &vrf_instances[target_vrf_idx];
                             if (target_vrf->kea_comm_fd != -1) {
@@ -353,7 +406,8 @@ void listen_and_dispatch_packets() {
                                 kea_dest_addr.sin_family = AF_INET;
                                 kea_dest_addr.sin_port = htons(DHCP_SERVER_PORT);
                                 if (inet_pton(AF_INET, target_vrf->veth_ns_ip, &kea_dest_addr.sin_addr) <= 0) {
-                                    LOG_ERROR("Invalid Kea ns IP for VRF %s: %s", target_vrf->name, target_vrf->veth_ns_ip); continue;
+                                    LOG_ERROR("Invalid Kea ns IP for VRF %s: %s", target_vrf->name, target_vrf->veth_ns_ip);
+                                    pthread_mutex_unlock(&vrf_list_mutex); continue;
                                 }
                                 if (sendto(target_vrf->kea_comm_fd, buffer, len, 0, (struct sockaddr *)&kea_dest_addr, sizeof(kea_dest_addr)) < 0) {
                                     LOG_ERROR("sendto to Kea VRF %s from if %s failed", target_vrf->name, if_vrf_maps[map_idx].if_name);
@@ -362,11 +416,14 @@ void listen_and_dispatch_packets() {
                                 }
                             } else LOG_WARN("Target VRF %s for if %s has no Kea socket.", target_vrf->name, if_vrf_maps[map_idx].if_name);
                         } else LOG_WARN("No valid VRF for request from if %s (map VRF %s, idx %d). Dropped.", if_vrf_maps[map_idx].if_name, if_vrf_maps[map_idx].vrf_name, target_vrf_idx);
+                        pthread_mutex_unlock(&vrf_list_mutex);
                     } else LOG_DEBUG("Non-BOOTREQUEST (op=%d) on if %s. Ignored.", dhcp_req->op, if_vrf_maps[map_idx].if_name);
                 }
             }
         }
+        pthread_mutex_unlock(&map_list_mutex); // Unlock after iterating if_vrf_maps
 
+        pthread_mutex_lock(&vrf_list_mutex); // Lock before accessing vrf_instances
         for (int i = 0; i < num_vrfs; ++i) {
             if (vrf_instances[i].kea_comm_fd != -1 && FD_ISSET(vrf_instances[i].kea_comm_fd, &read_fds)) {
                 char buffer[DHCP_PACKET_BUFFER_SIZE];
@@ -380,11 +437,13 @@ void listen_and_dispatch_packets() {
                 } else {
                     LOG_INFO("Rx %zd bytes from Kea for VRF %s (src %s:%d)", len, vrf_instances[i].name, inet_ntoa(kea_src_addr.sin_addr), ntohs(kea_src_addr.sin_port));
                     dhcp_packet_t *dhcp_reply = (dhcp_packet_t *)buffer;
-                    if (dhcp_reply->op == 2) { // BOOTREPLY
+                    if (dhcp_reply->op == 2) {
                         int reply_map_idx = -1;
+                        pthread_mutex_lock(&map_list_mutex); // Lock maps for reading
                         for(int k=0; k < num_if_vrf_maps; ++k) {
                             if (if_vrf_maps[k].vrf_idx == i) { reply_map_idx = k; break; }
                         }
+
                         if (reply_map_idx != -1 && if_vrf_maps[reply_map_idx].listen_fd != -1) {
                             struct sockaddr_in client_dest_addr = {0};
                             client_dest_addr.sin_family = AF_INET;
@@ -414,94 +473,150 @@ void listen_and_dispatch_packets() {
                                 LOG_INFO("Relayed Kea reply via sendmsg on if %s (src IP %s) for VRF %s", if_vrf_maps[reply_map_idx].if_name, if_vrf_maps[reply_map_idx].if_ip_str, vrf_instances[i].name);
                             }
                         } else LOG_WARN("No client if map for Kea reply from VRF %s.", vrf_instances[i].name);
+                        pthread_mutex_unlock(&map_list_mutex);
                     } else LOG_DEBUG("Non-BOOTREPLY (op=%d) from Kea for VRF %s.", dhcp_reply->op, vrf_instances[i].name);
                 }
             }
         }
+        pthread_mutex_unlock(&vrf_list_mutex); // Unlock vrf_instances access
 
         if (netlink_fd != -1 && FD_ISSET(netlink_fd, &read_fds)) {
-            char nl_buffer[4096];
-            struct iovec iov = { nl_buffer, sizeof(nl_buffer) };
-            struct sockaddr_nl sa;
-            struct msghdr msg = { &sa, sizeof(sa), &iov, 1, NULL, 0, 0 };
-            ssize_t nl_len = recvmsg(netlink_fd, &msg, 0);
+            // This part will be moved to netlink_thread_func
+            // For now, it stays, but needs mutex protection for shared data access
+            LOG_DEBUG("Dispatch Thread: Netlink activity detected (will be handled by Netlink thread).");
+            // char nl_dummy_buf[1];
+            // read(netlink_fd, nl_dummy_buf, sizeof(nl_dummy_buf)); // consume to clear from select, actual processing in netlink thread
+        }
+    }
+    LOG_INFO("Packet dispatching thread finished.");
+    return NULL;
+}
 
+void* netlink_thread_func(void *arg) {
+    (void)arg;
+    LOG_INFO("Netlink monitoring thread started.");
+    // Setup Netlink socket (if not already done in main and passed or global)
+    // For now, assume netlink_fd is global and setup in main.
+    // If it failed in main, this thread might not do much.
+
+    if (netlink_fd == -1) {
+        LOG_ERROR("Netlink thread: Netlink FD is invalid. Thread exiting.");
+        return NULL;
+    }
+
+    while(!global_shutdown_flag) {
+        char nl_buffer[4096];
+        struct iovec iov = { nl_buffer, sizeof(nl_buffer) };
+        struct sockaddr_nl sa;
+        struct msghdr msg = { &sa, sizeof(sa), &iov, 1, NULL, 0, 0 };
+
+        // Use select for timeout and shutdown check, or make recvmsg non-blocking
+        fd_set nl_read_fds;
+        FD_ZERO(&nl_read_fds);
+        FD_SET(netlink_fd, &nl_read_fds);
+        struct timeval nl_timeout = {.tv_sec = 1, .tv_usec = 0}; // Check shutdown flag periodically
+
+        int activity = select(netlink_fd + 1, &nl_read_fds, NULL, NULL, &nl_timeout);
+
+        if (activity < 0 && errno != EINTR) {
+            LOG_ERROR("Netlink Thread: select() error");
+            // Consider closing and reopening netlink_fd on certain errors
+            sleep(1); // Avoid busy loop
+            continue;
+        }
+        if (global_shutdown_flag) break;
+        if (activity == 0) continue; // Timeout, loop to check shutdown_flag
+
+        if (FD_ISSET(netlink_fd, &nl_read_fds)) {
+            ssize_t nl_len = recvmsg(netlink_fd, &msg, 0); // MSG_DONTWAIT for non-blocking
             if (nl_len < 0) {
-                if (errno != EINTR && errno != EAGAIN) {
-                    LOG_ERROR("Netlink recvmsg error"); close(netlink_fd); netlink_fd = -1;
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    LOG_ERROR("Netlink Thread: recvmsg error");
+                    // Potentially close and re-init netlink_fd or stop monitoring
+                    close(netlink_fd); netlink_fd = -1; pthread_exit(NULL); // Exit thread on unrecoverable error
                 }
-            } else {
-                for (struct nlmsghdr *nh = (struct nlmsghdr *)nl_buffer; NLMSG_OK(nh, nl_len); nh = NLMSG_NEXT(nh, nl_len)) {
-                    if (nh->nlmsg_type == NLMSG_DONE) break;
-                    if (nh->nlmsg_type == NLMSG_ERROR) {
-                         struct nlmsgerr *err = (struct nlmsgerr*)NLMSG_DATA(nh);
-                         LOG_ERROR("Netlink message error: %s (%d)", strerror(-err->error), -err->error); continue;
+                continue;
+            }
+
+            for (struct nlmsghdr *nh = (struct nlmsghdr *)nl_buffer; NLMSG_OK(nh, nl_len); nh = NLMSG_NEXT(nh, nl_len)) {
+                if (nh->nlmsg_type == NLMSG_DONE) break;
+                if (nh->nlmsg_type == NLMSG_ERROR) {
+                     struct nlmsgerr *err_msg = (struct nlmsgerr*)NLMSG_DATA(nh);
+                     LOG_ERROR("Netlink Thread: Netlink message error: %s (%d)", strerror(-err_msg->error), -err_msg->error); continue;
+                }
+                if (nh->nlmsg_type == RTM_NEWLINK || nh->nlmsg_type == RTM_DELLINK) {
+                    struct ifinfomsg *iface_info = (struct ifinfomsg *)NLMSG_DATA(nh);
+                    struct rtattr *rta = IFLA_RTA(iface_info);
+                    int rta_len = IFLA_PAYLOAD(nh);
+                    char if_name[IFNAMSIZ] = {0}, if_kind[IFNAMSIZ] = {0};
+                    for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
+                        if (rta->rta_type == IFLA_IFNAME) strncpy(if_name, (char *)RTA_DATA(rta), IFNAMSIZ -1);
+                        if (rta->rta_type == IFLA_LINKINFO) {
+                            struct rtattr *l_rta = (struct rtattr *)RTA_DATA(rta);
+                            int l_rta_len = RTA_PAYLOAD(rta);
+                            for(; RTA_OK(l_rta, l_rta_len); l_rta = RTA_NEXT(l_rta, l_rta_len)) {
+                                if (l_rta->rta_type == IFLA_INFO_KIND) {
+                                    strncpy(if_kind, (char *)RTA_DATA(l_rta), IFNAMSIZ -1); break;
+                                }
+                            }
+                        }
                     }
-                    if (nh->nlmsg_type == RTM_NEWLINK || nh->nlmsg_type == RTM_DELLINK) {
-                        struct ifinfomsg *iface_info = (struct ifinfomsg *)NLMSG_DATA(nh);
-                        struct rtattr *rta = IFLA_RTA(iface_info);
-                        int rta_len = IFLA_PAYLOAD(nh);
-                        char if_name[IFNAMSIZ] = {0}, if_kind[IFNAMSIZ] = {0};
-                        for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
-                            if (rta->rta_type == IFLA_IFNAME) strncpy(if_name, (char *)RTA_DATA(rta), IFNAMSIZ -1);
-                            if (rta->rta_type == IFLA_LINKINFO) {
-                                struct rtattr *l_rta = (struct rtattr *)RTA_DATA(rta);
-                                int l_rta_len = RTA_PAYLOAD(rta);
-                                for(; RTA_OK(l_rta, l_rta_len); l_rta = RTA_NEXT(l_rta, l_rta_len)) {
-                                    if (l_rta->rta_type == IFLA_INFO_KIND) {
-                                        strncpy(if_kind, (char *)RTA_DATA(l_rta), IFNAMSIZ -1); break;
-                                    }
+                    if (strlen(if_name) > 0 && strcmp(if_kind, "vrf") == 0) {
+                        pthread_mutex_lock(&vrf_list_mutex);
+                        pthread_mutex_lock(&map_list_mutex); // Need map_list_mutex for resolve_vrf_indices_for_maps
+
+                        if (nh->nlmsg_type == RTM_NEWLINK) {
+                            LOG_INFO("Netlink Thread: RTM_NEWLINK for VRF %s.", if_name);
+                            int already_managed = 0;
+                            for (int k = 0; k < num_vrfs; ++k) {
+                                if (strcmp(vrf_instances[k].name, if_name) == 0) {
+                                    already_managed = 1; LOG_INFO("VRF %s already managed.", if_name); break;
                                 }
                             }
-                        }
-                        if (strlen(if_name) > 0 && strcmp(if_kind, "vrf") == 0) {
-                            if (nh->nlmsg_type == RTM_NEWLINK) {
-                                LOG_INFO("Netlink RTM_NEWLINK: VRF Interface %s appeared.", if_name);
-                                int already_managed = 0;
-                                for (int k = 0; k < num_vrfs; ++k) {
-                                    if (strcmp(vrf_instances[k].name, if_name) == 0) {
-                                        already_managed = 1;
-                                        LOG_INFO("VRF %s already managed.", if_name); break;
-                                    }
+                            if (!already_managed && num_vrfs < MAX_VRFS) {
+                                vrf_instance_t *new_vrf = &vrf_instances[num_vrfs];
+                                memset(new_vrf, 0, sizeof(vrf_instance_t));
+                                new_vrf->kea_comm_fd = -1;
+                                strncpy(new_vrf->name, if_name, MAX_VRF_NAME_LEN -1);
+                                if (setup_namespace_for_vrf(new_vrf, num_vrfs) == 0 &&
+                                    launch_kea_in_namespace(new_vrf, num_vrfs) == 0 &&
+                                    setup_kea_communication_socket(new_vrf) == 0) {
+                                    LOG_INFO("Netlink Thread: Dynamically added VRF: %s", new_vrf->name);
+                                    num_vrfs++;
+                                    resolve_vrf_indices_for_maps();
+                                    if (pipe(notify_pipe) != -1) write(notify_pipe[1], "U", 1); // Signal dispatch thread
+                                } else {
+                                    LOG_ERROR("Netlink Thread: Failed to setup new VRF %s.", new_vrf->name);
+                                    cleanup_vrf_instance(new_vrf);
                                 }
-                                if (!already_managed && num_vrfs < MAX_VRFS) {
-                                    vrf_instance_t *new_vrf = &vrf_instances[num_vrfs];
-                                    memset(new_vrf, 0, sizeof(vrf_instance_t));
-                                    new_vrf->kea_comm_fd = -1;
-                                    strncpy(new_vrf->name, if_name, MAX_VRF_NAME_LEN -1);
-                                    if (setup_namespace_for_vrf(new_vrf, num_vrfs) == 0 &&
-                                        launch_kea_in_namespace(new_vrf, num_vrfs) == 0 && // Pass num_vrfs for subnet logic
-                                        setup_kea_communication_socket(new_vrf) == 0) {
-                                        LOG_INFO("Dynamically added and configured VRF: %s", new_vrf->name);
-                                        num_vrfs++;
-                                        resolve_vrf_indices_for_maps(); // Re-resolve map indices
-                                    } else {
-                                        LOG_ERROR("Failed to setup dynamically added VRF %s.", new_vrf->name);
-                                        cleanup_vrf_instance(new_vrf);
-                                    }
-                                } else if (num_vrfs >= MAX_VRFS) LOG_WARN("MAX_VRFS limit. Cannot add VRF %s.", if_name);
-                            } else if (nh->nlmsg_type == RTM_DELLINK) {
-                                LOG_INFO("Netlink RTM_DELLINK: VRF Interface %s disappeared.", if_name);
-                                int found_idx = -1;
-                                for (int k = 0; k < num_vrfs; ++k) {
-                                    if (strcmp(vrf_instances[k].name, if_name) == 0) { found_idx = k; break; }
-                                }
-                                if (found_idx != -1) {
-                                    LOG_INFO("Cleaning up dynamically deleted VRF: %s (idx %d)", vrf_instances[found_idx].name, found_idx);
-                                    cleanup_vrf_instance(&vrf_instances[found_idx]);
-                                    for (int k = found_idx; k < num_vrfs - 1; ++k) vrf_instances[k] = vrf_instances[k+1];
-                                    num_vrfs--;
-                                    LOG_INFO("VRF %s removed. Managed VRFs: %d", if_name, num_vrfs);
-                                    resolve_vrf_indices_for_maps(); // Re-resolve map indices
-                                } else LOG_INFO("VRF %s not actively managed.", if_name);
+                            } else if (num_vrfs >= MAX_VRFS) LOG_WARN("Netlink Thread: MAX_VRFS limit. Cannot add VRF %s.", if_name);
+                        } else if (nh->nlmsg_type == RTM_DELLINK) {
+                            LOG_INFO("Netlink Thread: RTM_DELLINK for VRF %s.", if_name);
+                            int found_idx = -1;
+                            for (int k = 0; k < num_vrfs; ++k) {
+                                if (strcmp(vrf_instances[k].name, if_name) == 0) { found_idx = k; break; }
                             }
+                            if (found_idx != -1) {
+                                LOG_INFO("Netlink Thread: Cleaning up deleted VRF: %s (idx %d)", vrf_instances[found_idx].name, found_idx);
+                                cleanup_vrf_instance(&vrf_instances[found_idx]);
+                                for (int k = found_idx; k < num_vrfs - 1; ++k) vrf_instances[k] = vrf_instances[k+1];
+                                num_vrfs--;
+                                LOG_INFO("Netlink Thread: VRF %s removed. Managed VRFs: %d", if_name, num_vrfs);
+                                resolve_vrf_indices_for_maps();
+                                if (pipe(notify_pipe) != -1) write(notify_pipe[1], "U", 1); // Signal dispatch thread
+                            } else LOG_INFO("Netlink Thread: Deleted VRF %s was not managed.", if_name);
                         }
+                        pthread_mutex_unlock(&map_list_mutex);
+                        pthread_mutex_unlock(&vrf_list_mutex);
                     }
                 }
             }
         }
     }
+    LOG_INFO("Netlink monitoring thread finished.");
+    return NULL;
 }
+
 
 void cleanup_vrf_instance(vrf_instance_t *vrf) {
     LOG_INFO("Cleaning up VRF instance: %s", vrf->name);
@@ -574,6 +689,20 @@ void sighup_handler(int sig) {
     // signal(SIGHUP, sighup_handler); // Not strictly necessary on modern Linux but harmless.
 }
 
+void app_signal_handler(int sig) {
+    LOG_INFO("Caught signal %d. Initiating shutdown...", sig);
+    global_shutdown_flag = 1;
+    // Write to notify_pipe to wake up select in dispatch_thread_func if it's blocking
+    if (notify_pipe[1] != -1) {
+        char dummy = 'S'; // S for Shutdown
+        if (write(notify_pipe[1], &dummy, 1) == -1 && errno != EAGAIN) {
+            LOG_ERROR("Failed to write to notify_pipe for shutdown signal.");
+        }
+    }
+    // Netlink thread will see global_shutdown_flag in its loop or on select timeout.
+}
+
+
 // Parses a single mapping string "if_name:vrf_name:if_ip"
 // Returns 0 on success, -1 on failure.
 // Populates the provided if_vrf_map_t struct.
@@ -606,6 +735,9 @@ int parse_mapping_string(char *map_str_copy, if_vrf_map_t *map_entry) {
     }
     map_entry->listen_fd = -1; // Should be initialized by caller or subsequent setup
     map_entry->vrf_idx = -1;   // Should be initialized by caller or subsequent setup
+    strncpy(map_entry->original_map_str, map_str_copy, sizeof(map_entry->original_map_str) -1 ); // Store original for comparison
+    map_entry->original_map_str[sizeof(map_entry->original_map_str)-1] = '\0';
+
     return 0;
 }
 
@@ -628,6 +760,12 @@ int parse_config_file(const char *filepath, if_vrf_map_t temp_maps[], int *temp_
     while (fgets(line_buffer, sizeof(line_buffer), fp)) {
         line_num++;
 
+        char original_line_for_map_str[512]; // Store the line before strtok_r modifies it
+        strncpy(original_line_for_map_str, line_buffer, sizeof(original_line_for_map_str)-1);
+        original_line_for_map_str[sizeof(original_line_for_map_str)-1] = '\0';
+        original_line_for_map_str[strcspn(original_line_for_map_str, "\n\r")] = 0;
+
+
         // Remove newline characters at the end
         line_buffer[strcspn(line_buffer, "\n\r")] = 0;
 
@@ -647,9 +785,16 @@ int parse_config_file(const char *filepath, if_vrf_map_t temp_maps[], int *temp_
             break;
         }
 
-        // parse_mapping_string uses strtok_r, which modifies the string.
-        // No need for another copy if trimmed_line points within line_buffer which is already a copy.
-        if (parse_mapping_string(trimmed_line, &temp_maps[*temp_num_maps]) == 0) {
+        char parse_line_copy[512];
+        strncpy(parse_line_copy, trimmed_line, sizeof(parse_line_copy)-1);
+        parse_line_copy[sizeof(parse_line_copy)-1] = '\0';
+
+
+        if (parse_mapping_string(parse_line_copy, &temp_maps[*temp_num_maps]) == 0) {
+            // Store the original trimmed line (before strtok_r) for comparison logic
+            strncpy(temp_maps[*temp_num_maps].original_map_str, trimmed_line, sizeof(temp_maps[*temp_num_maps].original_map_str) -1 );
+            temp_maps[*temp_num_maps].original_map_str[sizeof(temp_maps[*temp_num_maps].original_map_str)-1] = '\0';
+
             LOG_DEBUG("Config File Line %d: Parsed mapping Iface '%s' -> VRF '%s' (IP %s)", line_num,
                      temp_maps[*temp_num_maps].if_name,
                      temp_maps[*temp_num_maps].vrf_name,
@@ -669,25 +814,26 @@ int parse_config_file(const char *filepath, if_vrf_map_t temp_maps[], int *temp_
 // Parses -m command line arguments
 int process_cli_mappings(int argc, char *argv[], if_vrf_map_t maps[], int* num_maps, int max_maps) {
     int opt;
-    // Reset optind for separate getopt pass ONLY for -m options.
-    // This assumes main has already handled -c and determined if -m should be processed.
     optind = 1;
     *num_maps = 0;
 
-    // Loop through all options to find only 'm'
-    // The optstring "m:" means -m takes an argument.
-    while ((opt = getopt(argc, argv, ":m:")) != -1) { // Added ':' to suppress getopt errors for other options
+    while ((opt = getopt(argc, argv, ":m:")) != -1) {
         if (opt == 'm') {
             if (*num_maps >= max_maps) {
                 LOG_ERROR("Maximum number of interface-VRF mappings (%d) reached via -m. Ignoring further.", max_maps);
-                continue; // Continue to check for other 'm's but don't process
+                continue;
             }
             char *if_details_arg = optarg;
-            char if_details_copy[256]; // strtok_r modifies the string
+            char if_details_copy[256];
             strncpy(if_details_copy, if_details_arg, sizeof(if_details_copy) -1);
             if_details_copy[sizeof(if_details_copy)-1] = '\0';
 
             if(parse_mapping_string(if_details_copy, &maps[*num_maps]) == 0) {
+                 // For CLI maps, the original_map_str can be the optarg itself if needed for consistency,
+                 // or just the parsed components. Here, we'll reconstruct it for consistency.
+                 snprintf(maps[*num_maps].original_map_str, sizeof(maps[*num_maps].original_map_str),
+                          "%s:%s:%s", maps[*num_maps].if_name, maps[*num_maps].vrf_name, maps[*num_maps].if_ip_str);
+
                  LOG_INFO("CLI Mapping: Iface '%s' -> VRF '%s' (IP %s)", maps[*num_maps].if_name, maps[*num_maps].vrf_name, maps[*num_maps].if_ip_str);
                 (*num_maps)++;
             } else {
@@ -722,13 +868,10 @@ int setup_if_map_socket(if_vrf_map_t *map_entry) {
         return -1;
     }
 
-    // Allow address reuse - useful for quick restarts
     int reuse_addr_enable = 1;
     if (setsockopt(map_entry->listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr_enable, sizeof(reuse_addr_enable)) < 0) {
         LOG_ERROR("Failed to set SO_REUSEADDR on client listening socket for %s", map_entry->if_name);
-        // Non-fatal, but log it
     }
-
 
     struct sockaddr_in client_bind_addr;
     memset(&client_bind_addr, 0, sizeof(client_bind_addr));
@@ -756,89 +899,91 @@ int reload_interface_mappings() {
     }
     LOG_INFO("Reloading interface mappings from: %s", config_file_path);
 
-    if_vrf_map_t temp_maps[MAX_IF_VRF_MAPS];
-    int temp_num_maps = 0;
+    if_vrf_map_t temp_new_maps[MAX_IF_VRF_MAPS];
+    int temp_num_new_maps = 0;
 
-    if (parse_config_file(config_file_path, temp_maps, &temp_num_maps, MAX_IF_VRF_MAPS) != 0) {
+    if (parse_config_file(config_file_path, temp_new_maps, &temp_num_new_maps, MAX_IF_VRF_MAPS) != 0) {
         LOG_ERROR("Failed to parse config file %s during reload. Mappings unchanged.", config_file_path);
         return -1;
     }
 
-    // Mark all current maps as 'to_be_removed' initially by clearing their if_name
-    // This helps identify maps that are no longer in the config.
-    // A more robust way would be a boolean flag in the struct.
-    char old_if_names[MAX_IF_VRF_MAPS][IFNAMSIZ];
-    int old_fds[MAX_IF_VRF_MAPS];
-    for(int i=0; i < num_if_vrf_maps; ++i) {
-        strncpy(old_if_names[i], if_vrf_maps[i].if_name, IFNAMSIZ);
-        old_fds[i] = if_vrf_maps[i].listen_fd;
-        if_vrf_maps[i].if_name[0] = '\0'; // Mark as potentially removed
-        if_vrf_maps[i].listen_fd = -1;    // Mark fd as potentially closed
-    }
+    if_vrf_map_t updated_maps[MAX_IF_VRF_MAPS];
+    int updated_num_maps = 0;
+    int old_map_processed[MAX_IF_VRF_MAPS] = {0}; // Track which old maps are carried over or modified
 
-    int current_active_maps = num_if_vrf_maps; // Save current count before modifying
-    num_if_vrf_maps = 0; // Reset global count, will be repopulated
-
-    for (int i = 0; i < temp_num_maps; ++i) {
-        int found_old_map_idx = -1;
-        // Try to find this new map in the old set (by if_name, vrf_name)
-        for (int j = 0; j < current_active_maps; ++j) {
-            if (strlen(old_if_names[j]) > 0 && // Check if this old slot was not already processed/marked
-                strcmp(temp_maps[i].if_name, old_if_names[j]) == 0 &&
-                strcmp(temp_maps[i].vrf_name, if_vrf_maps[j].vrf_name /* use original global for vrf_name */ ) == 0) {
-                found_old_map_idx = j;
+    // Iterate through new maps from config file
+    for (int i = 0; i < temp_num_new_maps; ++i) {
+        int found_match_in_old = -1;
+        for (int j = 0; j < num_if_vrf_maps; ++j) {
+            // Match based on if_name and vrf_name
+            if (strcmp(temp_new_maps[i].if_name, if_vrf_maps[j].if_name) == 0 &&
+                strcmp(temp_new_maps[i].vrf_name, if_vrf_maps[j].vrf_name) == 0) {
+                found_match_in_old = j;
                 break;
             }
         }
 
-        if (found_old_map_idx != -1) { // Existing mapping
-            LOG_DEBUG("Mapping for if %s, vrf %s exists. Checking for IP change.", temp_maps[i].if_name, temp_maps[i].vrf_name);
-            // Compare IPs. If IP changed, old socket needs to be closed and new one created.
-            if (strcmp(temp_maps[i].if_ip_str, if_vrf_maps[found_old_map_idx].if_ip_str) != 0) {
-                LOG_INFO("IP changed for mapping %s:%s. Old IP: %s, New IP: %s. Recreating socket.",
-                         temp_maps[i].if_name, temp_maps[i].vrf_name,
-                         if_vrf_maps[found_old_map_idx].if_ip_str, temp_maps[i].if_ip_str);
-                if (old_fds[found_old_map_idx] != -1) close(old_fds[found_old_map_idx]);
-                // Copy new details, listen_fd will be recreated
-                if_vrf_maps[num_if_vrf_maps] = temp_maps[i]; // Includes new IP
-                if_vrf_maps[num_if_vrf_maps].listen_fd = -1;
+        if (updated_num_maps >= MAX_IF_VRF_MAPS) { LOG_WARN("Max mappings reached during reload build. Some new maps ignored."); break;}
+
+        if (found_match_in_old != -1) { // Map existed
+            old_map_processed[found_match_in_old] = 1; // Mark as processed
+            // Check if IP address changed
+            if (strcmp(temp_new_maps[i].if_ip_str, if_vrf_maps[found_match_in_old].if_ip_str) != 0) {
+                LOG_INFO("IP changed for map %s:%s (Old: %s, New: %s). Recreating socket.",
+                         temp_new_maps[i].if_name, temp_new_maps[i].vrf_name,
+                         if_vrf_maps[found_match_in_old].if_ip_str, temp_new_maps[i].if_ip_str);
+                if (if_vrf_maps[found_match_in_old].listen_fd != -1) {
+                    close(if_vrf_maps[found_match_in_old].listen_fd);
+                }
+                updated_maps[updated_num_maps] = temp_new_maps[i]; // Copy new data
+                updated_maps[updated_num_maps].listen_fd = -1; // Mark for new socket creation
             } else {
-                // IP Unchanged, preserve socket and vrf_idx (vrf_idx will be re-resolved anyway)
-                LOG_DEBUG("Mapping for %s:%s unchanged. Preserving socket FD %d.", temp_maps[i].if_name, temp_maps[i].vrf_name, old_fds[found_old_map_idx]);
-                if_vrf_maps[num_if_vrf_maps] = if_vrf_maps[found_old_map_idx]; // Copy old entry
-                if_vrf_maps[num_if_vrf_maps].listen_fd = old_fds[found_old_map_idx]; // Restore FD
-                strncpy(if_vrf_maps[num_if_vrf_maps].if_name, old_if_names[found_old_map_idx], IFNAMSIZ); // Restore name
+                // Unchanged map, copy it as is (preserving listen_fd and vrf_idx)
+                LOG_DEBUG("Map %s:%s unchanged. Preserving.", temp_new_maps[i].if_name, temp_new_maps[i].vrf_name);
+                updated_maps[updated_num_maps] = if_vrf_maps[found_match_in_old];
             }
-            old_if_names[found_old_map_idx][0] = '\0'; // Mark as processed
-        } else { // New mapping
-            LOG_INFO("New mapping found for if %s, vrf %s, IP %s. Will create socket.",
-                     temp_maps[i].if_name, temp_maps[i].vrf_name, temp_maps[i].if_ip_str);
-            if_vrf_maps[num_if_vrf_maps] = temp_maps[i];
-            if_vrf_maps[num_if_vrf_maps].listen_fd = -1;
+        } else { // New map
+            LOG_INFO("New map from config: %s:%s:%s. Adding.", temp_new_maps[i].if_name, temp_new_maps[i].vrf_name, temp_new_maps[i].if_ip_str);
+            updated_maps[updated_num_maps] = temp_new_maps[i];
+            updated_maps[updated_num_maps].listen_fd = -1; // Mark for new socket creation
         }
-        num_if_vrf_maps++;
+        updated_num_maps++;
     }
 
-    // Close sockets for mappings that were in old config but not in new
-    for (int j = 0; j < current_active_maps; ++j) {
-        if (strlen(old_if_names[j]) > 0 && old_fds[j] != -1) { // If not processed (i.e., removed)
-            LOG_INFO("Mapping for interface %s (FD %d) removed. Closing socket.", old_if_names[j], old_fds[j]);
-            close(old_fds[j]);
-        }
-    }
-
-    // Re-create sockets for new or modified IP mappings
+    // Close sockets for maps that were in old config but not in new (removed)
     for (int i = 0; i < num_if_vrf_maps; ++i) {
-        if (if_vrf_maps[i].listen_fd == -1) {
+        if (!old_map_processed[i] && if_vrf_maps[i].listen_fd != -1) {
+            LOG_INFO("Map %s:%s removed. Closing socket FD %d.", if_vrf_maps[i].if_name, if_vrf_maps[i].vrf_name, if_vrf_maps[i].listen_fd);
+            close(if_vrf_maps[i].listen_fd);
+        }
+    }
+
+    // Update the global maps array
+    memcpy(if_vrf_maps, updated_maps, updated_num_maps * sizeof(if_vrf_map_t));
+    num_if_vrf_maps = updated_num_maps;
+    // Clear out any remaining old entries beyond the new count, just in case
+    if (num_if_vrf_maps < MAX_IF_VRF_MAPS) {
+         memset(&if_vrf_maps[num_if_vrf_maps], 0, (MAX_IF_VRF_MAPS - num_if_vrf_maps) * sizeof(if_vrf_map_t));
+    }
+
+
+    // Re-create sockets for new or modified IP mappings and re-resolve VRF indexes
+    for (int i = 0; i < num_if_vrf_maps; ++i) {
+        if (if_vrf_maps[i].listen_fd == -1) { // Needs new socket
             if (setup_if_map_socket(&if_vrf_maps[i]) != 0) {
-                LOG_ERROR("Failed to setup socket for reloaded/new map %s. It will be inactive.", if_vrf_maps[i].if_name);
-                // Keep listen_fd as -1
+                LOG_ERROR("Failed to setup socket for (re)loaded map %s. It will be inactive.", if_vrf_maps[i].if_name);
             }
         }
     }
 
     resolve_vrf_indices_for_maps(); // Re-resolve all VRF indexes
     LOG_INFO("Interface mappings reloaded. Active mappings: %d", num_if_vrf_maps);
+    if (notify_pipe[1] != -1) { // Notify dispatch thread to rebuild its fd_set
+        char dummy = 'R'; // R for Rebuild
+        if(write(notify_pipe[1], &dummy, 1) == -1 && errno != EAGAIN) {
+            LOG_ERROR("Failed to write to notify_pipe for config reload.");
+        }
+    }
     return 0;
 }
 
@@ -846,19 +991,30 @@ int reload_interface_mappings() {
 int main(int argc, char *argv[]) {
     LOG_INFO("Kea Per-VRF DHCP Service Orchestrator starting...");
 
+    pthread_mutex_init(&vrf_list_mutex, NULL);
+    pthread_mutex_init(&map_list_mutex, NULL);
+
+    if (pipe(notify_pipe) == -1) {
+        LOG_ERROR("Failed to create notify_pipe. Exiting.");
+        return EXIT_FAILURE;
+    }
+    // Make pipe non-blocking for writer to avoid blocking signal handler or main thread if pipe is full
+    // (though only one byte is written, so less likely an issue here)
+    // fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
+    // fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
+
+
     // Parse command line options
     int opt_c;
     opterr = 0;
     while((opt_c = getopt(argc, argv, "c:m:")) != -1) {
         if (opt_c == 'c') {
-            config_file_path = strdup(optarg); // Use strdup for config_file_path
+            config_file_path = strdup(optarg);
             if (!config_file_path) { LOG_ERROR("strdup failed for config_file_path"); return EXIT_FAILURE; }
             use_config_file_mappings = 1;
             break;
         } else if (opt_c == 'm') {
-            // Handled in second pass if -c not found
         } else if (opt_c == '?') {
-            // Error will be caught by final check or print_usage
         }
     }
     opterr = 1;
@@ -871,24 +1027,25 @@ int main(int argc, char *argv[]) {
             if (temp_opt == 'm') { m_opt_present = 1; break; }
         }
         if (m_opt_present) LOG_WARN("Config file (-c) specified; -m options ignored for initial setup.");
-        // Load from config file (Step 5)
+
+        pthread_mutex_lock(&map_list_mutex);
         if (parse_config_file(config_file_path, if_vrf_maps, &num_if_vrf_maps, MAX_IF_VRF_MAPS) != 0) {
-            LOG_ERROR("Failed to load initial mappings from config file %s. Exiting.", config_file_path);
-            // Potentially allow running without mappings if desired, but for now, treat as critical if file specified but fails.
-            // However, SIGHUP reload might still work if the file is fixed later.
-            // For now, continue, relay will be non-functional until SIGHUP fixes it.
-             num_if_vrf_maps = 0; // Ensure it's zero if parse failed badly
+             LOG_WARN("Failed to load initial mappings from config file %s. Relay may not function until SIGHUP reload.", config_file_path);
+             num_if_vrf_maps = 0;
         }
+        pthread_mutex_unlock(&map_list_mutex);
 
     } else {
+        pthread_mutex_lock(&map_list_mutex);
         process_cli_mappings(argc, argv, if_vrf_maps, &num_if_vrf_maps, MAX_IF_VRF_MAPS);
+        pthread_mutex_unlock(&map_list_mutex);
         if (num_if_vrf_maps == 0) {
             LOG_WARN("No client interface to VRF mappings provided via -m. DHCP relay will not function unless a config file is specified and loaded via SIGHUP.");
         }
     }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    signal(SIGINT, app_signal_handler);  // Use app_signal_handler for graceful shutdown
+    signal(SIGTERM, app_signal_handler); // Use app_signal_handler for graceful shutdown
     signal(SIGHUP, sighup_handler);
 
     struct stat st = {0};
@@ -934,28 +1091,103 @@ int main(int argc, char *argv[]) {
             num_vrfs++;
         } else {
             LOG_ERROR("Failed to setup initial VRF %s.", current_vrf->name);
-            cleanup_vrf_instance(current_vrf); // Ensure partial setup is cleaned
+            cleanup_vrf_instance(current_vrf);
         }
     }
 
-    resolve_vrf_indices_for_maps(); // Resolve after initial VRFs are up
+    pthread_mutex_lock(&map_list_mutex);
+    pthread_mutex_lock(&vrf_list_mutex);
+    resolve_vrf_indices_for_maps();
+    pthread_mutex_unlock(&vrf_list_mutex);
+    pthread_mutex_unlock(&map_list_mutex);
 
-    // Setup listening sockets for each mapped client interface
+    pthread_mutex_lock(&map_list_mutex);
     for (int i = 0; i < num_if_vrf_maps; ++i) {
         if(setup_if_map_socket(&if_vrf_maps[i]) != 0) {
             LOG_ERROR("Failed to setup listening socket for map %s:%s:%s. This map will be inactive.",
                 if_vrf_maps[i].if_name, if_vrf_maps[i].vrf_name, if_vrf_maps[i].if_ip_str);
-            // listen_fd will be -1
+        }
+    }
+    pthread_mutex_unlock(&map_list_mutex);
+
+    // Create threads
+    pthread_t dispatch_tid, netlink_tid;
+    if (pthread_create(&dispatch_tid, NULL, dispatch_thread_func, NULL) != 0) {
+        LOG_ERROR("Failed to create packet dispatch thread. Exiting.");
+        // Perform cleanup before exiting
+        goto cleanup_and_exit;
+    }
+    if (netlink_fd != -1) { // Only create netlink thread if socket is valid
+        if (pthread_create(&netlink_tid, NULL, netlink_thread_func, NULL) != 0) {
+            LOG_ERROR("Failed to create netlink monitoring thread. Continuing without dynamic VRF updates.");
+            // Not necessarily fatal, main dispatch can continue. Mark netlink_fd as unusable.
+            close(netlink_fd);
+            netlink_fd = -1;
+        }
+    } else {
+        LOG_WARN("Netlink socket not available, Netlink monitoring thread will not be started.");
+    }
+
+    // Main thread loop for SIGHUP and shutdown signal checking
+    LOG_INFO("Main thread entering monitoring loop (SIGHUP, shutdown).");
+    while(!global_shutdown_flag) {
+        sleep(1); // Check flags periodically
+        if (reload_config_flag) {
+            LOG_INFO("Main Thread: Reload config flag detected.");
+            pthread_mutex_lock(&map_list_mutex); // Protect global if_vrf_maps
+            pthread_mutex_lock(&vrf_list_mutex); // Protect global vrf_instances for resolve_vrf_indices
+            reload_interface_mappings();
+            pthread_mutex_unlock(&vrf_list_mutex);
+            pthread_mutex_unlock(&map_list_mutex);
+            reload_config_flag = 0;
+            if (notify_pipe[1] != -1) { // Signal dispatch thread to rebuild its fd_set
+                 char dummy = 'R';
+                 if(write(notify_pipe[1], &dummy, 1) == -1 && errno != EAGAIN) {
+                     LOG_ERROR("Main Thread: Failed to write to notify_pipe for config reload.");
+                 }
+            }
         }
     }
 
-    listen_and_dispatch_packets();
+    LOG_INFO("Main thread: Shutdown signal received. Waiting for worker threads to exit...");
+    pthread_join(dispatch_tid, NULL);
+    LOG_INFO("Packet dispatch thread joined.");
+    if (netlink_fd != -1 && netlink_tid) { // Check if netlink_tid was successfully created
+         pthread_join(netlink_tid, NULL);
+         LOG_INFO("Netlink monitoring thread joined.");
+    }
 
-    // Cleanup
-    for (int i = 0; i < num_vrfs; ++i) cleanup_vrf_instance(&vrf_instances[i]);
-    if (config_file_path) free(config_file_path); // Free duplicated string
-    LOG_INFO("Orchestrator shut down.");
+
+cleanup_and_exit:
+    // Final cleanup of global resources
+    LOG_INFO("Performing final cleanup of VRFs and mappings...");
+    pthread_mutex_lock(&map_list_mutex);
+    for (int i = 0; i < num_if_vrf_maps; ++i) {
+        if (if_vrf_maps[i].listen_fd != -1) {
+            close(if_vrf_maps[i].listen_fd);
+            if_vrf_maps[i].listen_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&map_list_mutex);
+
+    pthread_mutex_lock(&vrf_list_mutex);
+    for (int i = 0; i < num_vrfs; ++i) {
+        cleanup_vrf_instance(&vrf_instances[i]); // Stops Kea, closes kea_comm_fd, removes ns/veth
+    }
+    pthread_mutex_unlock(&vrf_list_mutex);
+
+    if (config_file_path) free(config_file_path);
+    if (netlink_fd != -1) close(netlink_fd);
+    if (notify_pipe[0] != -1) close(notify_pipe[0]);
+    if (notify_pipe[1] != -1) close(notify_pipe[1]);
+
+    pthread_mutex_destroy(&vrf_list_mutex);
+    pthread_mutex_destroy(&map_list_mutex);
+
+    LOG_INFO("Orchestrator shut down gracefully.");
     return EXIT_SUCCESS;
 }
+
+[end of kea-vrf-orchestrator/src/orchestrator.c]
 
 [end of kea-vrf-orchestrator/src/orchestrator.c]
